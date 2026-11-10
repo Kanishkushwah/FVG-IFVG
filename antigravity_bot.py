@@ -186,8 +186,19 @@ class CoinDCXClient:
         return headers, body_json
 
     def get_candles(self, pair: str, interval: str, limit: int = 500) -> pd.DataFrame:
+        # CoinDCX API natively only supports [1m, 15m, 1h, 1d].
+        # For 5m and 30m, we smartly fetch 1m/15m and resample in memory.
+        fetch_interval = interval
+        resample_rule = None
+        if interval == "5m":
+            fetch_interval = "1m"
+            resample_rule = "5min"
+        elif interval == "30m":
+            fetch_interval = "15m"
+            resample_rule = "30min"
+
         url = f"{PUBLIC_BASE}/market_data/candles"
-        params = {"pair": pair, "interval": interval, "limit": limit}
+        params = {"pair": pair, "interval": fetch_interval, "limit": limit}
 
         resp = self.session.get(url, params=params, timeout=12)
         if resp.status_code == 429:
@@ -207,6 +218,13 @@ class CoinDCXClient:
         # Localize millisecond timestamp to IST datetime
         df["Time"] = pd.to_datetime(df["Time"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST).dt.tz_localize(None)
         df = df.sort_values("Time").reset_index(drop=True)
+
+        # Smart in-memory resampling for intervals like 5m and 30m
+        if resample_rule:
+            df = df.set_index("Time").resample(resample_rule).agg({
+                "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+            }).dropna().reset_index()
+
         return df[["Time", "Open", "High", "Low", "Close", "Volume"]]
 
     def create_order(self, side: str, order_type: str, market: str,
