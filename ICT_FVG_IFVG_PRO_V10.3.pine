@@ -1,0 +1,1165 @@
+//@version=6
+indicator("ICT FVG + IFVG PRO V10.3 | ANCHORED FIX",
+     overlay=true,
+     max_boxes_count=350,
+     max_labels_count=150,
+     max_lines_count=150)
+
+//====================================================
+// 01. INPUTS
+//====================================================
+
+g1 = "FVG Detection"
+
+tf1Enable = input.bool(true, "Enable Timeframe 1", group=g1, inline="tf1")
+tf1 = input.timeframe("15", "", group=g1, inline="tf1")
+
+tf2Enable = input.bool(true, "Enable Timeframe 2", group=g1, inline="tf2")
+tf2 = input.timeframe("30", "", group=g1, inline="tf2")
+
+tf3Enable = input.bool(false, "Enable Timeframe 3", group=g1, inline="tf3")
+tf3 = input.timeframe("60", "", group=g1, inline="tf3")
+
+atrLen = input.int(14, "ATR Length", minval=1, group=g1)
+minGapATR = input.float(0.15, "Minimum Gap ATR", minval=0.01, step=0.05, group=g1)
+minBody = input.float(65, "Displacement Body %", minval=1, maxval=100, group=g1)
+
+g2 = "Quality Filters"
+
+minScore = input.int(80, "Minimum Quality", minval=0, maxval=100, group=g2)
+swingLen = input.int(10, "Structure Lookback", minval=2, group=g2)
+sweepLookback = input.int(10, "Sweep Lookback", minval=1, group=g2)
+volLen = input.int(20, "Volume Average", minval=1, group=g2)
+volMult = input.float(1.2, "Relative Volume", minval=0.1, group=g2)
+
+requireSweep = input.bool(false, "Require Liquidity Sweep", group=g2)
+requireBOS = input.bool(false, "Require BOS", group=g2)
+
+g3 = "Zone Management"
+
+maxZones = input.int(12, "Maximum Zones", minval=5, maxval=40, group=g3)
+
+zoneWidth = input.int(8, "Zone Width (HTF Candles)", minval=1, maxval=50, group=g3)
+
+maxZoneAge = input.int(500, "Maximum Zone Age", minval=50, group=g3)
+
+requireTap = input.bool(true, "Require FVG Tap Before IFVG", group=g3)
+
+retestTolerance = input.float(0.25, "Retest Tolerance (x ATR)", minval=0, step=0.05, group=g3, tooltip="How close price must get to the exact entry edge to count as a retest. 0 = must touch the exact wick price (strictest, fewest signals). Higher = more signals, slightly less precise entry.")
+
+showOriginal = input.bool(true, "Show FVG", group=g3)
+
+showInverted = input.bool(true, "Show IFVG", group=g3)
+
+showQuality = input.bool(true, "Show Quality Score", group=g3)
+
+showZoneText = input.bool(true, "Show Zone Text", group=g3)
+
+g4 = "Entry & Risk"
+
+enableEntries = input.bool(true, "Enable Entries", group=g4)
+
+useTrendFilter = input.bool(true, "Use Trend Filter (EMA)", group=g4, tooltip="Only take LONGs when price is above the trend EMA, and only SHORTs when price is below it. Blocks counter-trend entries taken in the middle of a strong impulsive move — backtesting showed this cuts max drawdown roughly in half and raises win rate, at the cost of fewer trades.")
+
+trendEmaLen = input.int(200, "Trend EMA Length", minval=10, group=g4)
+
+minimumRR = input.float(1.5, "Minimum RR", minval=1.5, step=0.1, group=g4)
+
+slBuffer = input.float(1.0, "SL ATR Buffer (minimum)", minval=0, step=0.05, group=g4, tooltip="Minimum stop distance in ATR. Actual stop is whichever is LARGER: this ATR buffer, or (zone height x the multiplier below) — so the stop always clears the zone with real room, not just the exact entry wick.")
+
+slZoneMultiplier = input.float(1.5, "SL Zone Height Multiplier", minval=0.5, step=0.25, group=g4, tooltip="Stop distance from the zone edge = zone height x this multiplier (if that's bigger than the ATR buffer above). Raise this if stops still feel too tight on fast/volatile instruments like index futures.")
+
+targetLookback = input.int(50, "Target Lookback", minval=5, group=g4)
+
+maxPositions = input.int(20, "Position History", minval=1, maxval=40, group=g4)
+
+showPositions = input.bool(true, "Show Position Boxes", group=g4)
+
+showEntryLabels = input.bool(true, "Show LONG/SHORT Labels", group=g4)
+
+g5 = "Visual Colors"
+
+bullColor = input.color(color.rgb(0,165,90), "Bullish FVG", group=g5)
+
+bearColor = input.color(color.rgb(220,55,65), "Bearish FVG", group=g5)
+
+bullIFVGColor = input.color(color.rgb(35,110,225), "Bullish IFVG", group=g5)
+
+bearIFVGColor = input.color(color.rgb(235,125,20), "Bearish IFVG", group=g5)
+
+
+//====================================================
+// 02. MULTI-TIMEFRAME VALIDATION (no crash, silent skip)
+//====================================================
+// Instead of hard-erroring when a selected timeframe is below the
+// chart's own timeframe (e.g. picking 15m FVGs on a 30m chart), each
+// slot is just marked invalid and silently skipped — so a 30m chart
+// with 30m/1H/4H FVGs keeps working, and only a genuinely mismatched
+// slot (lower than chart TF) is ignored instead of breaking everything.
+
+tf1Valid = timeframe.in_seconds(tf1) >= timeframe.in_seconds()
+
+tf2Valid = timeframe.in_seconds(tf2) >= timeframe.in_seconds()
+
+tf3Valid = timeframe.in_seconds(tf3) >= timeframe.in_seconds()
+
+// FIX: instead of just skipping an invalid slot (chosen TF smaller than
+// the current chart's TF), fall back to the chart's OWN timeframe for
+// that slot. This means a slot never goes fully dead just because you
+// switched the main chart to a higher timeframe than what you configured
+// — entries can always form, on whatever chart timeframe you're viewing.
+
+tf1Eff = tf1Valid ? tf1 : timeframe.period
+
+tf2Eff = tf2Valid ? tf2 : timeframe.period
+
+tf3Eff = tf3Valid ? tf3 : timeframe.period
+
+f_tfLabel(string tf) =>
+    switch tf
+        "1" => "1M"
+        "3" => "3M"
+        "5" => "5M"
+        "15" => "15M"
+        "30" => "30M"
+        "60" => "1H"
+        "120" => "2H"
+        "240" => "4H"
+        "D" => "1D"
+        "W" => "1W"
+        => tf
+
+atr = ta.atr(atrLen)
+
+// Trend filter: only take longs above this EMA, shorts below it —
+// stops the indicator from firing counter-trend entries in the middle
+// of a strong impulsive move (which backtesting showed was the single
+// biggest source of large losing trades / big drawdown).
+
+trendEma = ta.ema(close, trendEmaLen)
+
+
+//====================================================
+// 03. FVG DETECTION ENGINE
+//====================================================
+
+f_detect() =>
+
+    a = ta.atr(atrLen)
+
+    body = math.abs(close[1] - open[1])
+
+    candleRange = high[1] - low[1]
+
+    bodyPct = candleRange > 0 ? body / candleRange * 100 : 0.0
+
+    bullDisp = close[1] > open[1] and bodyPct >= minBody
+
+    bearDisp = close[1] < open[1] and bodyPct >= minBody
+
+    bullGap = low - high[2]
+
+    bearGap = low[2] - high
+
+    bull = high[2] < low and bullDisp and bullGap >= a * minGapATR
+
+    bear = low[2] > high and bearDisp and bearGap >= a * minGapATR
+
+    previousLow = ta.lowest(low[2], swingLen)
+
+    previousHigh = ta.highest(high[2], swingLen)
+
+    ssl = low[1] < previousLow and close[1] > previousLow
+
+    bsl = high[1] > previousHigh and close[1] < previousHigh
+
+    sslBars = ta.barssince(ssl)
+
+    bslBars = ta.barssince(bsl)
+
+    recentSSL = not na(sslBars) and sslBars <= sweepLookback
+
+    recentBSL = not na(bslBars) and bslBars <= sweepLookback
+
+    bullBOS = close[1] > previousHigh
+
+    bearBOS = close[1] < previousLow
+
+    volAvg = ta.sma(volume, volLen)
+
+    volOK = not na(volAvg[1]) and volAvg[1] > 0 and volume[1] >= volAvg[1] * volMult
+
+    bullScore = (bullDisp ? 25 : 0) +
+         (bullGap >= a * minGapATR ? 15 : 0) +
+         (recentSSL ? 25 : 0) +
+         (bullBOS ? 20 : 0) +
+         (volOK ? 15 : 0)
+
+    bearScore = (bearDisp ? 25 : 0) +
+         (bearGap >= a * minGapATR ? 15 : 0) +
+         (recentBSL ? 25 : 0) +
+         (bearBOS ? 20 : 0) +
+         (volOK ? 15 : 0)
+
+    validBull = bull and bullScore >= minScore and
+         (not requireSweep or recentSSL) and
+         (not requireBOS or bullBOS)
+
+    validBear = bear and bearScore >= minScore and
+         (not requireSweep or recentBSL) and
+         (not requireBOS or bearBOS)
+
+    [
+         validBull,
+         validBear,
+         low,
+         high[2],
+         low[2],
+         high,
+         bullScore,
+         bearScore,
+         time[2]
+     ]
+
+
+//====================================================
+// 04. CONFIRMED HTF DATA
+//====================================================
+
+f_confirmed() =>
+
+    [b,s,bt,bb,st,sb,bs,ss,origin] = f_detect()
+
+    [
+         b[1],
+         s[1],
+         bt[1],
+         bb[1],
+         st[1],
+         sb[1],
+         bs[1],
+         ss[1],
+         origin[1]
+     ]
+
+// Three independent HTF feeds — e.g. 30m + 1H + 4H FVGs on the same
+// chart at once. Each is requested unconditionally (cheap, and Pine
+// wants security calls stable across bars); whether it's actually
+// used to draw anything is gated by tfXEnable and tfXValid below.
+
+[hBull1,hBear1,hBullTop1,hBullBottom1,hBearTop1,hBearBottom1,hBullScore1,hBearScore1,hOrigin1] =
+     request.security(syminfo.tickerid, tf1Eff, f_confirmed(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+[hBull2,hBear2,hBullTop2,hBullBottom2,hBearTop2,hBearBottom2,hBullScore2,hBearScore2,hOrigin2] =
+     request.security(syminfo.tickerid, tf2Eff, f_confirmed(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+[hBull3,hBear3,hBullTop3,hBullBottom3,hBearTop3,hBearBottom3,hBullScore3,hBearScore3,hOrigin3] =
+     request.security(syminfo.tickerid, tf3Eff, f_confirmed(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+
+//====================================================
+// 05. ZONE ARRAYS
+//====================================================
+
+var box[] zoneBoxes = array.new_box()
+
+var float[] zoneTops = array.new_float()
+
+var float[] zoneBottoms = array.new_float()
+
+var int[] zoneDirections = array.new_int()
+
+var int[] zoneStates = array.new_int()
+
+var int[] zoneScores = array.new_int()
+
+var bool[] zoneTapped = array.new_bool()
+
+var int[] zoneRetest = array.new_int()
+
+var int[] zoneBorn = array.new_int()
+
+var string[] zoneTFLabel = array.new_string()
+
+// 0 = FVG
+// 1 = IFVG
+// 3 = Entry confirmed
+
+
+//====================================================
+// 06. ZONE TEXT AND COLORS
+//====================================================
+
+f_zoneColor(int direction, int state) =>
+
+    state == 1 or state == 3 ?
+         (direction == 1 ? bullIFVGColor : bearIFVGColor) :
+         (direction == 1 ? bullColor : bearColor)
+
+
+f_zoneText(string tfLabel, int direction, int state, int score) =>
+
+    directionText = direction == 1 ? "BULL" : "BEAR"
+
+    typeText = state == 1 or state == 3 ? "IFVG" : "FVG"
+
+    scoreText = showQuality ? " Q" + str.tostring(score) : ""
+
+    tfLabel + " " + directionText + " " + typeText + scoreText
+
+
+//====================================================
+// 07. DUPLICATE DETECTION
+//====================================================
+
+f_isDuplicate(float top, float bottom, int direction) =>
+
+    bool duplicate = false
+
+    if array.size(zoneBoxes) > 0
+
+        for j = 0 to array.size(zoneBoxes)-1
+
+            existingTop = array.get(zoneTops,j)
+
+            existingBottom = array.get(zoneBottoms,j)
+
+            existingDirection = array.get(zoneDirections,j)
+
+            overlap = math.max(
+                 0.0,
+                 math.min(top,existingTop) -
+                 math.max(bottom,existingBottom)
+                 )
+
+            newHeight = math.max(top-bottom,syminfo.mintick)
+
+            overlapRatio = overlap/newHeight
+
+            if existingDirection == direction and overlapRatio >= 0.80
+
+                duplicate := true
+
+    duplicate
+
+
+//====================================================
+// 08. CREATE FIXED ANCHORED ZONE
+//====================================================
+// Left and right edges are both set once, in absolute chart time
+// (xloc.bar_time) — this is what keeps a zone perfectly fixed in
+// place when you zoom or pan, since it's anchored to real time, not
+// to a bar index that shifts as you scroll. Width is controlled by
+// the "Zone Width (HTF Candles)" input.
+
+f_addZone(float top, float bottom, int direction, int score, int origin, int tfSeconds, string tfLabel) =>
+
+    if not f_isDuplicate(top,bottom,direction)
+
+        c = direction == 1 ? bullColor : bearColor
+
+        duration = int(tfSeconds * 1000 * zoneWidth)
+
+        rightTime = origin + duration
+
+        initialTransparency = showOriginal ? 88 : 100
+
+        initialBorder = showOriginal ? c : color.new(c,100)
+
+        b = box.new(
+             left=origin,
+             top=top,
+             right=rightTime,
+             bottom=bottom,
+             xloc=xloc.bar_time,
+             extend=extend.none,
+             bgcolor=color.new(c,initialTransparency),
+             border_color=initialBorder,
+             border_width=score >= 85 ? 2 : 1
+             )
+
+        // FIX: text visibility now depends ONLY on "Show Zone Text" —
+        // previously it also required "Show FVG" (showOriginal) to be
+        // on, so a freshly created zone showed no label at all until
+        // it inverted into an IFVG, making it look like plain colored
+        // boxes with no FVG/IFVG identification.
+
+        box.set_text(
+             b,
+             showZoneText ?
+             f_zoneText(tfLabel,direction,0,score) : ""
+             )
+
+        box.set_text_color(b,color.black)
+
+        box.set_text_size(b,size.normal)
+
+        box.set_text_halign(b,text.align_left)
+
+        box.set_text_valign(b,text.align_center)
+
+        array.push(zoneBoxes,b)
+
+        array.push(zoneTops,top)
+
+        array.push(zoneBottoms,bottom)
+
+        array.push(zoneDirections,direction)
+
+        array.push(zoneStates,0)
+
+        array.push(zoneScores,score)
+
+        array.push(zoneTapped,false)
+
+        array.push(zoneRetest,-1)
+
+        array.push(zoneBorn,bar_index)
+
+        array.push(zoneTFLabel,tfLabel)
+
+
+//====================================================
+// 09. SAFE ZONE REMOVAL
+//====================================================
+
+f_removeZone(int i) =>
+
+    box.delete(array.get(zoneBoxes,i))
+
+    array.remove(zoneBoxes,i)
+
+    array.remove(zoneTops,i)
+
+    array.remove(zoneBottoms,i)
+
+    array.remove(zoneDirections,i)
+
+    array.remove(zoneStates,i)
+
+    array.remove(zoneScores,i)
+
+    array.remove(zoneTapped,i)
+
+    array.remove(zoneRetest,i)
+
+    array.remove(zoneBorn,i)
+
+    array.remove(zoneTFLabel,i)
+
+
+//====================================================
+// 10. NEW FVG DETECTION — ACROSS ALL ENABLED TIMEFRAMES
+//====================================================
+// Each of the 3 timeframe slots runs the exact same detection and
+// zone-creation path, just gated by its own enable toggle and the
+// tfXValid check from section 02. This is how 30m + 1H + 4H FVGs can
+// all appear on the same chart simultaneously.
+
+newHTF1 = timeframe.change(tf1Eff)
+
+newBull1 = tf1Enable and barstate.isconfirmed and newHTF1 and hBull1 and not na(hOrigin1)
+
+newBear1 = tf1Enable and barstate.isconfirmed and newHTF1 and hBear1 and not na(hOrigin1)
+
+if newBull1 and (showOriginal or showInverted)
+
+    f_addZone(hBullTop1,hBullBottom1,1,hBullScore1,hOrigin1,timeframe.in_seconds(tf1Eff),f_tfLabel(tf1Eff))
+
+if newBear1 and (showOriginal or showInverted)
+
+    f_addZone(hBearTop1,hBearBottom1,-1,hBearScore1,hOrigin1,timeframe.in_seconds(tf1Eff),f_tfLabel(tf1Eff))
+
+newHTF2 = timeframe.change(tf2Eff)
+
+newBull2 = tf2Enable and barstate.isconfirmed and newHTF2 and hBull2 and not na(hOrigin2)
+
+newBear2 = tf2Enable and barstate.isconfirmed and newHTF2 and hBear2 and not na(hOrigin2)
+
+if newBull2 and (showOriginal or showInverted)
+
+    f_addZone(hBullTop2,hBullBottom2,1,hBullScore2,hOrigin2,timeframe.in_seconds(tf2Eff),f_tfLabel(tf2Eff))
+
+if newBear2 and (showOriginal or showInverted)
+
+    f_addZone(hBearTop2,hBearBottom2,-1,hBearScore2,hOrigin2,timeframe.in_seconds(tf2Eff),f_tfLabel(tf2Eff))
+
+newHTF3 = timeframe.change(tf3Eff)
+
+newBull3 = tf3Enable and barstate.isconfirmed and newHTF3 and hBull3 and not na(hOrigin3)
+
+newBear3 = tf3Enable and barstate.isconfirmed and newHTF3 and hBear3 and not na(hOrigin3)
+
+if newBull3 and (showOriginal or showInverted)
+
+    f_addZone(hBullTop3,hBullBottom3,1,hBullScore3,hOrigin3,timeframe.in_seconds(tf3Eff),f_tfLabel(tf3Eff))
+
+if newBear3 and (showOriginal or showInverted)
+
+    f_addZone(hBearTop3,hBearBottom3,-1,hBearScore3,hOrigin3,timeframe.in_seconds(tf3Eff),f_tfLabel(tf3Eff))
+
+
+//====================================================
+// 11. POSITION ARRAYS
+//====================================================
+
+var box[] tpBoxes = array.new_box()
+
+var box[] slBoxes = array.new_box()
+
+var line[] entryLines = array.new_line()
+
+var label[] entryLabels = array.new_label()
+
+var float[] posEntries = array.new_float()
+
+var float[] posStops = array.new_float()
+
+var float[] posTargets = array.new_float()
+
+var int[] posDirections = array.new_int()
+
+var int[] posStates = array.new_int()
+
+var int[] posBorn = array.new_int()
+
+// 0 = Active
+// 1 = TP Hit
+// 2 = SL Hit
+
+
+//====================================================
+// 12. ACTIVE POSITION COUNT
+//====================================================
+
+f_activeCount() =>
+
+    int count = 0
+
+    if array.size(posStates) > 0
+
+        for i = 0 to array.size(posStates)-1
+
+            if array.get(posStates,i) == 0
+
+                count += 1
+
+    count
+
+
+//====================================================
+// 13. POSITION CREATION
+//====================================================
+// FIX: entry line/label/boxes are anchored to `entryBar` — the actual
+// bar where price touched the zone (the retest bar) — not to the
+// current bar_index. This is what stops the label from "floating
+// away" from the candles as new bars print: it stays pinned to the
+// real historical bar where the level was touched, at the exact
+// zone boundary price.
+
+f_createPosition(int direction, float entry, float stop, float target, int entryBar) =>
+
+    tpTop = math.max(entry,target)
+
+    tpBottom = math.min(entry,target)
+
+    slTop = math.max(entry,stop)
+
+    slBottom = math.min(entry,stop)
+
+    // TAKE PROFIT BOX
+
+    tp = box.new(
+         left=entryBar,
+         top=tpTop,
+         right=bar_index+1,
+         bottom=tpBottom,
+         xloc=xloc.bar_index,
+         bgcolor=color.new(color.rgb(75,190,145),82),
+         border_color=color.new(color.rgb(75,190,145),100)
+         )
+
+    // STOP LOSS BOX
+
+    sl = box.new(
+         left=entryBar,
+         top=slTop,
+         right=bar_index+1,
+         bottom=slBottom,
+         xloc=xloc.bar_index,
+         bgcolor=color.new(color.rgb(235,95,105),82),
+         border_color=color.new(color.rgb(235,95,105),100)
+         )
+
+    // EXACT ENTRY PRICE LINE (pinned to the retest bar + exact price)
+
+    ln = line.new(
+         x1=entryBar,
+         y1=entry,
+         x2=bar_index+1,
+         y2=entry,
+         xloc=xloc.bar_index,
+         color=color.rgb(35,35,35),
+         width=2
+         )
+
+    // EXACT ENTRY LABEL — sits precisely on the retest bar and price level
+
+    label lb = na
+
+    if showEntryLabels
+
+        lb := label.new(
+             x=entryBar,
+             y=entry,
+             text=(direction == 1 ? "LONG @ " : "SHORT @ ") + str.tostring(entry,format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=direction == 1 ? label.style_label_up : label.style_label_down,
+             color=direction == 1 ?
+                 color.rgb(5,35,20) :
+                 color.rgb(55,10,14),
+             textcolor=color.white,
+             size=size.small
+             )
+
+    array.push(tpBoxes,tp)
+
+    array.push(slBoxes,sl)
+
+    array.push(entryLines,ln)
+
+    array.push(entryLabels,lb)
+
+    array.push(posEntries,entry)
+
+    array.push(posStops,stop)
+
+    array.push(posTargets,target)
+
+    array.push(posDirections,direction)
+
+    array.push(posStates,0)
+
+    array.push(posBorn,bar_index)
+
+
+//====================================================
+// 14. SIGNAL FLAGS
+//====================================================
+
+bool bullIFVG = false
+
+bool bearIFVG = false
+
+bool bullFVGTap = false
+
+bool bearFVGTap = false
+
+bool bullIFVGTap = false
+
+bool bearIFVGTap = false
+
+bool longSignal = false
+
+bool shortSignal = false
+
+bool tpHit = false
+
+bool slHit = false
+
+float selectedLongBottom = na
+
+float selectedShortTop = na
+
+int selectedLongScore = -1
+
+int selectedShortScore = -1
+
+int selectedLongBar = na
+
+int selectedShortBar = na
+
+float selectedLongTop = na
+
+float selectedShortBottom = na
+
+box selectedLongBox = na
+
+box selectedShortBox = na
+
+
+//====================================================
+// 15. FVG + IFVG PROCESSING
+//====================================================
+
+if barstate.isconfirmed and array.size(zoneBoxes) > 0
+
+    for i = array.size(zoneBoxes)-1 to 0
+
+        if i >= 0 and i < array.size(zoneBoxes)
+
+            bool removedZone = false
+
+            b = array.get(zoneBoxes,i)
+
+            top = array.get(zoneTops,i)
+
+            bottom = array.get(zoneBottoms,i)
+
+            direction = array.get(zoneDirections,i)
+
+            state = array.get(zoneStates,i)
+
+            score = array.get(zoneScores,i)
+
+            tapped = array.get(zoneTapped,i)
+
+            retest = array.get(zoneRetest,i)
+
+            born = array.get(zoneBorn,i)
+
+            tfLabel = array.get(zoneTFLabel,i)
+
+            // EXPIRE OLD ZONES
+
+            if bar_index-born > maxZoneAge
+
+                f_removeZone(i)
+
+                removedZone := true
+
+            else if bar_index > born
+
+                touched = low <= top and high >= bottom
+
+                // ORIGINAL FVG
+
+                if state == 0
+
+                    if touched and not tapped
+
+                        array.set(zoneTapped,i,true)
+
+                        if direction == 1
+                            bullFVGTap := true
+                        else
+                            bearFVGTap := true
+
+                    brokenBull = direction == 1 and close < bottom
+
+                    brokenBear = direction == -1 and close > top
+
+                    if (brokenBull or brokenBear) and
+                         (not requireTap or tapped or touched)
+
+                        newDirection = -direction
+
+                        if showInverted
+
+                            array.set(zoneDirections,i,newDirection)
+
+                            array.set(zoneStates,i,1)
+
+                            array.set(zoneTapped,i,false)
+
+                            array.set(zoneRetest,i,-1)
+
+                            array.set(zoneBorn,i,bar_index)
+
+                            c = f_zoneColor(newDirection,1)
+
+                            box.set_bgcolor(b,color.new(c,88))
+
+                            box.set_border_color(b,c)
+
+                            box.set_text(
+                                 b,
+                                 showZoneText ?
+                                 f_zoneText(tfLabel,newDirection,1,score) : ""
+                                 )
+
+                            box.set_text_color(b,color.black)
+
+                            if newDirection == 1
+                                bullIFVG := true
+                            else
+                                bearIFVG := true
+
+                        else
+
+                            f_removeZone(i)
+
+                            removedZone := true
+
+                // ACTIVE IFVG
+
+                else if state == 1
+
+                    invalidBull = direction == 1 and close < bottom
+
+                    invalidBear = direction == -1 and close > top
+
+                    if invalidBull or invalidBear
+
+                        f_removeZone(i)
+
+                        removedZone := true
+
+                    else
+
+                        // FIX: retest must touch the EXACT edge that will
+                        // become the entry price (bottom for a bullish
+                        // zone, top for a bearish zone) — not just any
+                        // overlap with the zone. Otherwise the retest bar
+                        // gets locked in the moment price grazes the far
+                        // side of the zone, and the label/line later gets
+                        // anchored to a candle that never actually reached
+                        // the entry price, making it look disconnected.
+
+                        tol = atr * retestTolerance
+
+                        touchedEdge = direction == 1 ? low <= bottom + tol : high >= top - tol
+
+                        if touchedEdge and retest == -1
+
+                            array.set(zoneRetest,i,bar_index)
+
+                            if direction == 1
+                                bullIFVGTap := true
+                            else
+                                bearIFVGTap := true
+
+                        if retest >= 0 and bar_index > retest
+
+                            bullishConfirm = direction == 1 and close > top and close > open
+
+                            bearishConfirm = direction == -1 and close < bottom and close < open
+
+                            if bullishConfirm or bearishConfirm
+
+                                array.set(zoneStates,i,3)
+
+                                box.set_text(
+                                     b,
+                                     showZoneText ?
+                                     f_zoneText(tfLabel,direction,3,score) : ""
+                                     )
+
+                                // NOTE: no box highlighting happens here
+                                // anymore. Several zones can reach "confirmed"
+                                // on the same bar, but only ONE (the highest
+                                // score) actually becomes a trade. Highlighting
+                                // every confirmed zone made it impossible to
+                                // tell which one the entry actually came from.
+                                // The box reference is tracked (selectedLongBox
+                                // / selectedShortBox) and only highlighted in
+                                // section 17, AFTER a trade is actually created
+                                // from it.
+
+                                if bullishConfirm and score > selectedLongScore
+
+                                    selectedLongBottom := bottom
+
+                                    selectedLongScore := score
+
+                                    selectedLongBar := retest
+
+                                    selectedLongTop := top
+
+                                    selectedLongBox := b
+
+                                if bearishConfirm and score > selectedShortScore
+
+                                    selectedShortTop := top
+
+                                    selectedShortScore := score
+
+                                    selectedShortBar := retest
+
+                                    selectedShortBottom := bottom
+
+                                    selectedShortBox := b
+
+
+//====================================================
+// 16. STRUCTURAL TARGETS
+//====================================================
+
+recentHigh = ta.highest(high[1],targetLookback)
+
+recentLow = ta.lowest(low[1],targetLookback)
+
+
+//====================================================
+// 17. ENTRY GENERATION
+//====================================================
+// FIX: entry price is now the exact IFVG boundary (selectedLongBottom /
+// selectedShortTop) — the real institutional limit-entry level — instead
+// of the confirmation candle's close. SL buffer and RR math are unchanged,
+// just computed relative to the true entry price.
+
+canEnter = enableEntries and showPositions and
+     barstate.isconfirmed and f_activeCount() == 0
+
+// Trend gate: long only valid above the EMA, short only valid below it.
+// When useTrendFilter is off, both are always true (no behavior change).
+
+trendOKLong = not useTrendFilter or close > trendEma
+
+trendOKShort = not useTrendFilter or close < trendEma
+
+if canEnter
+
+    // LONG
+
+    if not na(selectedLongBottom) and trendOKLong
+
+        entry = selectedLongBottom
+
+        // FIX: stop distance is now the larger of (zone height) or
+        // (ATR buffer) — not just a tiny ATR fraction beyond entry.
+        // Previously the stop sat almost on top of the entry because
+        // entry itself was already the zone's own edge.
+        zoneHeight = selectedLongTop - selectedLongBottom
+
+        slDistance = math.max(zoneHeight * slZoneMultiplier, atr * slBuffer)
+
+        stop = selectedLongBottom - slDistance
+
+        risk = entry-stop
+
+        if risk > syminfo.mintick
+
+            minimumTarget = entry + risk * minimumRR
+
+            target = not na(recentHigh) and recentHigh > minimumTarget ?
+                 recentHigh : minimumTarget
+
+            actualRR = (target-entry)/risk
+
+            if actualRR >= minimumRR
+
+                f_createPosition(1,entry,stop,target,selectedLongBar)
+
+                longSignal := true
+
+                // Highlight ONLY this exact zone — the one that actually
+                // produced this trade — so it's unmistakably linked to
+                // the LONG label. Extend its box to the current bar and
+                // thicken its border.
+
+                if not na(selectedLongBox)
+
+                    if time > box.get_right(selectedLongBox)
+
+                        box.set_right(selectedLongBox,time)
+
+                    box.set_border_width(selectedLongBox,4)
+
+    // SHORT
+
+    else if not na(selectedShortTop) and trendOKShort
+
+        entry = selectedShortTop
+
+        // FIX: same stop-distance logic as the long side — the larger
+        // of zone height or ATR buffer, instead of a tiny fraction.
+        zoneHeight = selectedShortTop - selectedShortBottom
+
+        slDistance = math.max(zoneHeight * slZoneMultiplier, atr * slBuffer)
+
+        stop = selectedShortTop + slDistance
+
+        risk = stop-entry
+
+        if risk > syminfo.mintick
+
+            minimumTarget = entry-risk*minimumRR
+
+            target = not na(recentLow) and recentLow < minimumTarget ?
+                 recentLow : minimumTarget
+
+            actualRR = (entry-target)/risk
+
+            if actualRR >= minimumRR
+
+                f_createPosition(-1,entry,stop,target,selectedShortBar)
+
+                shortSignal := true
+
+                // Same targeted highlight for the short side.
+
+                if not na(selectedShortBox)
+
+                    if time > box.get_right(selectedShortBox)
+
+                        box.set_right(selectedShortBox,time)
+
+                    box.set_border_width(selectedShortBox,4)
+
+
+//====================================================
+// 18. POSITION MONITORING
+//====================================================
+
+if barstate.isconfirmed and array.size(posStates) > 0
+
+    for i = 0 to array.size(posStates)-1
+
+        if i < array.size(posStates)
+
+            positionState = array.get(posStates,i)
+
+            if positionState == 0
+
+                entry = array.get(posEntries,i)
+
+                stop = array.get(posStops,i)
+
+                target = array.get(posTargets,i)
+
+                direction = array.get(posDirections,i)
+
+                born = array.get(posBorn,i)
+
+                tp = array.get(tpBoxes,i)
+
+                sl = array.get(slBoxes,i)
+
+                ln = array.get(entryLines,i)
+
+                // EXTEND ACTIVE POSITION
+
+                box.set_right(tp,bar_index+1)
+
+                box.set_right(sl,bar_index+1)
+
+                line.set_x2(ln,bar_index+1)
+
+                if bar_index > born
+
+                    hitStop = direction == 1 ?
+                         low <= stop : high >= stop
+
+                    hitTarget = direction == 1 ?
+                         high >= target : low <= target
+
+                    // SL PRIORITY
+
+                    if hitStop
+
+                        array.set(posStates,i,2)
+
+                        slHit := true
+
+                    else if hitTarget
+
+                        array.set(posStates,i,1)
+
+                        tpHit := true
+
+
+//====================================================
+// 19. HISTORY CLEANUP
+//====================================================
+// FIX: when the zone count exceeds "Maximum Zones", the cleanup used
+// to always delete the single oldest zone — even if that zone was the
+// exact one that produced a trade (state 3). That's why an older
+// SHORT/LONG label's highlighted box kept disappearing as new zones
+// formed. Now it prefers to delete the oldest UNCONFIRMED zone first,
+// and only touches a confirmed (traded) zone if literally every zone
+// left is confirmed.
+
+f_oldestRemovableIndex() =>
+
+    int idx = -1
+
+    int oldestBorn = 999999999
+
+    if array.size(zoneBoxes) > 0
+
+        for j = 0 to array.size(zoneBoxes)-1
+
+            st = array.get(zoneStates,j)
+
+            bn = array.get(zoneBorn,j)
+
+            if st != 3 and bn < oldestBorn
+
+                oldestBorn := bn
+
+                idx := j
+
+    if idx == -1 and array.size(zoneBoxes) > 0
+
+        idx := 0
+
+    idx
+
+while array.size(zoneBoxes) > maxZones
+
+    f_removeZone(f_oldestRemovableIndex())
+
+
+while array.size(posStates) > maxPositions
+
+    box.delete(array.shift(tpBoxes))
+
+    box.delete(array.shift(slBoxes))
+
+    line.delete(array.shift(entryLines))
+
+    oldLabel = array.shift(entryLabels)
+
+    if not na(oldLabel)
+
+        label.delete(oldLabel)
+
+    array.shift(posEntries)
+
+    array.shift(posStops)
+
+    array.shift(posTargets)
+
+    array.shift(posDirections)
+
+    array.shift(posStates)
+
+    array.shift(posBorn)
+
+
+plot(useTrendFilter ? trendEma : na, "Trend EMA", color=color.rgb(120,120,120), linewidth=2)
+
+
+//====================================================
+// 20. ALERTS
+//====================================================
+
+newBullAny = newBull1 or newBull2 or newBull3
+
+newBearAny = newBear1 or newBear2 or newBear3
+
+alertcondition(newBullAny,"Bullish FVG","Qualified bullish FVG formed.")
+
+alertcondition(newBearAny,"Bearish FVG","Qualified bearish FVG formed.")
+
+alertcondition(bullIFVG,"Bullish IFVG","Bullish IFVG formed.")
+
+alertcondition(bearIFVG,"Bearish IFVG","Bearish IFVG formed.")
+
+alertcondition(bullFVGTap,"Bullish FVG Retest","Bullish FVG retested.")
+
+alertcondition(bearFVGTap,"Bearish FVG Retest","Bearish FVG retested.")
+
+alertcondition(bullIFVGTap,"Bullish IFVG Retest","Bullish IFVG retested.")
+
+alertcondition(bearIFVGTap,"Bearish IFVG Retest","Bearish IFVG retested.")
+
+alertcondition(longSignal,"LONG ENTRY","Confirmed LONG entry.")
+
+alertcondition(shortSignal,"SHORT ENTRY","Confirmed SHORT entry.")
+
+alertcondition(tpHit,"TP HIT","Take profit reached.")
+
+alertcondition(slHit,"SL HIT","Stop loss reached.")
