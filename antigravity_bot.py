@@ -115,8 +115,10 @@ class Position:
 BOT_STATE = {
     "start_time": time.time(),
     "paper_balance_inr": PAPER_BALANCE_INR,
+    "total_pnl_inr": 0.0,
     "last_poll_time": None,
     "last_candle_times": {tf: None for tf in TIMEFRAMES},
+    "active_zones": {tf: 0 for tf in TIMEFRAMES},
     "active_positions": {},
     "total_signals": 0,
     "total_trades_closed": 0,
@@ -128,17 +130,34 @@ STATE_LOCK = threading.Lock()
 # BINANCE PUBLIC MARKET DATA CLIENT (Exact TradingView Candles)
 # ==============================================================================
 class BinanceDataClient:
-    """Fetches exact candles directly from Binance Public API (Zero KYC, No API Key needed)."""
-    BASE_URL = "https://api.binance.com/api/v3/klines"
+    """Fetches exact candles directly from Binance Public Market Data APIs (Zero KYC, No API Key needed)."""
+    ENDPOINTS = [
+        "https://data-api.binance.vision/api/v3/klines",
+        "https://api.binance.com/api/v3/klines",
+        "https://api1.binance.com/api/v3/klines",
+    ]
 
     def __init__(self):
         self.session = requests.Session()
 
     def get_candles(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
         params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-        resp = self.session.get(self.BASE_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        raw_data = resp.json()
+        last_err = None
+        raw_data = None
+
+        for url in self.ENDPOINTS:
+            try:
+                resp = self.session.get(url, params=params, timeout=10)
+                if resp.status_code == 451:
+                    continue  # Geo-restricted on this host/region; try next mirror
+                resp.raise_for_status()
+                raw_data = resp.json()
+                break
+            except Exception as e:
+                last_err = e
+
+        if raw_data is None:
+            raise RuntimeError(f"All Binance endpoints failed ({last_err})")
 
         # Binance kline format:
         # [open_time, open, high, low, close, volume, close_time, ...]
@@ -346,7 +365,7 @@ class FVGStrategy:
                 if hit_stop:
                     decisions.append({
                         "action": "close", "reason": "SL/Trailing Stop", "direction": "LONG" if d == 1 else "SHORT",
-                        "price": pos.stop, "entry": pos.entry, "qty": pos.qty, "bar": i,
+                        "price": float(pos.stop), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(i),
                         "tf": self.tf_label, "candle_time": candle_time
                     })
                     self.position = None
@@ -354,23 +373,23 @@ class FVGStrategy:
                 elif hit_target:
                     decisions.append({
                         "action": "close", "reason": "TP", "direction": "LONG" if d == 1 else "SHORT",
-                        "price": pos.target, "entry": pos.entry, "qty": pos.qty, "bar": i,
+                        "price": float(pos.target), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(i),
                         "tf": self.tf_label, "candle_time": candle_time
                     })
                     self.position = None
                     continue
 
                 # Trailing checks
-                favorable = (h[i] - pos.entry) if d == 1 else (pos.entry - l[i])
+                favorable = float(h[i] - pos.entry) if d == 1 else float(pos.entry - l[i])
                 dist_to_tp = abs(pos.target - pos.entry)
 
                 # Cost-to-Cost at 50% TP
                 if not pos.sl_moved_to_be and favorable >= (dist_to_tp * 0.5):
-                    pos.stop = pos.entry
+                    pos.stop = float(pos.entry)
                     pos.sl_moved_to_be = True
                     decisions.append({
                         "action": "trail", "reason": "50% TP Hit (Cost-to-Cost)",
-                        "new_stop": pos.stop, "tf": self.tf_label, "candle_time": candle_time
+                        "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
                     })
 
                 # +1R Milestone Trailing
@@ -378,13 +397,13 @@ class FVGStrategy:
                 r_milestone = int(current_r)
                 if r_milestone >= 2 and r_milestone > pos.locked_r + 1:
                     pos.locked_r = r_milestone - 1
-                    new_stop = pos.entry + (pos.locked_r * pos.initial_risk * d)
+                    new_stop = float(pos.entry + (pos.locked_r * pos.initial_risk * d))
                     is_tighter = (new_stop > pos.stop) if d == 1 else (new_stop < pos.stop)
                     if is_tighter:
                         pos.stop = new_stop
                         decisions.append({
                             "action": "trail", "reason": f"+{r_milestone}R Reached (Locked +{int(pos.locked_r)}R)",
-                            "new_stop": pos.stop, "tf": self.tf_label, "candle_time": candle_time
+                            "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
                         })
 
             # 4. Entry Signals
@@ -393,45 +412,48 @@ class FVGStrategy:
                 recent_low = np.min(l[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
                 trend_ok_long = (not USE_TREND_FILTER) or (c[i] > ema_trend[i])
                 trend_ok_short = (not USE_TREND_FILTER) or (c[i] < ema_trend[i])
+                risk_usd = RISK_PER_TRADE_INR / USDT_INR_RATE
 
                 if selected_long is not None and trend_ok_long:
                     bottom, top, score, rb = selected_long
-                    entry = bottom
-                    zh = top - bottom
-                    sl_dist = max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER)
-                    stop = entry - sl_dist
-                    risk = entry - stop
+                    entry = float(bottom)
+                    zh = float(top - bottom)
+                    sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
+                    stop = float(entry - sl_dist)
+                    risk = float(entry - stop)
 
                     if risk > 1e-4:
                         min_target = entry + risk * MIN_RR
-                        target = recent_high if (not np.isnan(recent_high) and recent_high > min_target) else min_target
-                        actual_rr = (target - entry) / risk
+                        target = float(recent_high) if (not np.isnan(recent_high) and recent_high > min_target) else float(min_target)
+                        actual_rr = float((target - entry) / risk)
                         if actual_rr >= MIN_RR:
-                            self.position = Position(1, entry, stop, target, rb, actual_rr, risk)
+                            qty = round(risk_usd / risk, 6)
+                            self.position = Position(1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
                                 "action": "open", "direction": "LONG", "entry": entry, "stop": stop,
-                                "target": target, "rr": actual_rr, "risk": risk, "score": score,
-                                "bar": i, "tf": self.tf_label, "candle_time": candle_time
+                                "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
+                                "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
                             })
 
                 elif selected_short is not None and trend_ok_short:
                     top, bottom, score, rb = selected_short
-                    entry = top
-                    zh = top - bottom
-                    sl_dist = max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER)
-                    stop = entry + sl_dist
-                    risk = stop - entry
+                    entry = float(top)
+                    zh = float(top - bottom)
+                    sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
+                    stop = float(entry + sl_dist)
+                    risk = float(stop - entry)
 
                     if risk > 1e-4:
                         min_target = entry - risk * MIN_RR
-                        target = recent_low if (not np.isnan(recent_low) and recent_low < min_target) else min_target
-                        actual_rr = (entry - target) / risk
+                        target = float(recent_low) if (not np.isnan(recent_low) and recent_low < min_target) else float(min_target)
+                        actual_rr = float((entry - target) / risk)
                         if actual_rr >= MIN_RR:
-                            self.position = Position(-1, entry, stop, target, rb, actual_rr, risk)
+                            qty = round(risk_usd / risk, 6)
+                            self.position = Position(-1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
                                 "action": "open", "direction": "SHORT", "entry": entry, "stop": stop,
-                                "target": target, "rr": actual_rr, "risk": risk, "score": score,
-                                "bar": i, "tf": self.tf_label, "candle_time": candle_time
+                                "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
+                                "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
                             })
 
         self.processed_count = n
@@ -456,8 +478,11 @@ def health():
             "chart_feed": f"Binance {SYMBOL} (Exact TradingView Match)",
             "timeframes": TIMEFRAMES,
             "paper_balance_inr": round(BOT_STATE["paper_balance_inr"], 2),
+            "total_pnl_inr": round(BOT_STATE["total_pnl_inr"], 2),
             "risk_per_trade_inr": RISK_PER_TRADE_INR,
             "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "last_candle_times": BOT_STATE["last_candle_times"],
+            "active_zones": BOT_STATE["active_zones"],
             "active_positions": BOT_STATE["active_positions"],
             "total_signals": BOT_STATE["total_signals"],
             "total_trades_closed": BOT_STATE["total_trades_closed"],
@@ -477,9 +502,6 @@ def run_trading_bot():
     engines = {tf: FVGStrategy(tf) for tf in TIMEFRAMES}
     last_candle_times = {tf: None for tf in TIMEFRAMES}
 
-    # Sizing conversion: ₹200 INR risk in USD terms
-    risk_usd = RISK_PER_TRADE_INR / USDT_INR_RATE
-
     log.info("=" * 65)
     log.info(f"ANTIGRAVITY BOT RUNNING ON BINANCE {SYMBOL} @ {TIMEFRAMES}")
     log.info(f"Chart Feed: 100% TradingView BINANCE:BTCUSDT Match")
@@ -487,71 +509,99 @@ def run_trading_bot():
     log.info("=" * 65)
 
     while True:
-        for tf in TIMEFRAMES:
-            try:
-                df = client.get_candles(SYMBOL, tf, limit=500)
-            except Exception as e:
-                log.warning(f"Error fetching {tf} candles from Binance: {e}")
-                continue
-
-            if df is None or len(df) < 30:
-                continue
-
-            latest_closed_time = str(df["Time"].iloc[-2])
-            if latest_closed_time == last_candle_times[tf]:
-                continue
-            last_candle_times[tf] = latest_closed_time
-
+        try:
             with STATE_LOCK:
-                BOT_STATE["last_candle_times"][tf] = latest_closed_time
+                BOT_STATE["last_poll_time"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
-            df_closed = df.iloc[:-1].reset_index(drop=True)
-            strat = engines[tf]
-            decisions = strat.step(df_closed)
+            for tf in TIMEFRAMES:
+                try:
+                    df = client.get_candles(SYMBOL, tf, limit=500)
+                except Exception as e:
+                    log.warning(f"[{tf}] Error fetching candles from Binance: {e}")
+                    continue
 
-            for d in decisions:
-                action = d["action"]
+                if df is None or len(df) < 30:
+                    continue
 
-                if action == "open":
-                    risk_dist_usd = abs(d["entry"] - d["stop"])
-                    qty = round(risk_usd / risk_dist_usd, 6)
-                    strat.position.qty = qty
+                latest_closed_time = str(df["Time"].iloc[-2])
+                if latest_closed_time == last_candle_times[tf]:
+                    continue
 
-                    log.info(f"🚨 [{tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
-                    log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
-                    log.info(f"    Size: {qty} BTC (Risk Capped at Exactly ₹{RISK_PER_TRADE_INR:.2f} INR)")
+                is_warmup = (last_candle_times[tf] is None)
+                last_candle_times[tf] = latest_closed_time
 
-                    with STATE_LOCK:
-                        BOT_STATE["total_signals"] += 1
-                        BOT_STATE["active_positions"][tf] = {
-                            "direction": d["direction"],
-                            "entry_usd": f"${d['entry']:,.2f}",
-                            "stop_usd": f"${d['stop']:,.2f}",
-                            "target_usd": f"${d['target']:,.2f}",
-                            "rr": d["rr"],
-                            "time": d["candle_time"]
-                        }
-                        BOT_STATE["recent_decisions"].append(d)
+                df_closed = df.iloc[:-1].reset_index(drop=True)
+                strat = engines[tf]
+                decisions = strat.step(df_closed)
 
-                elif action == "trail":
-                    log.info(f"🛡️ [{tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
-                    with STATE_LOCK:
-                        if tf in BOT_STATE["active_positions"] and BOT_STATE["active_positions"][tf]:
-                            BOT_STATE["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
-                        BOT_STATE["recent_decisions"].append(d)
+                with STATE_LOCK:
+                    BOT_STATE["last_candle_times"][tf] = latest_closed_time
+                    BOT_STATE["active_zones"][tf] = len(strat.zones)
 
-                elif action == "close":
-                    pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
-                    pnl_inr = pnl_usd * USDT_INR_RATE
+                # On startup warmup, build zones/EMA200 state without executing historical days-old trades
+                if is_warmup:
+                    strat.position = None
+                    log.info(
+                        f"[{tf}] Warmed up {len(df_closed)} bars (latest: {latest_closed_time} IST). "
+                        f"Active FVG/IFVG zones: {len(strat.zones)}. Monitoring live..."
+                    )
+                    continue
 
-                    with STATE_LOCK:
-                        BOT_STATE["paper_balance_inr"] += pnl_inr
-                        BOT_STATE["total_trades_closed"] += 1
-                        BOT_STATE["active_positions"][tf] = None
-                        BOT_STATE["recent_decisions"].append(d)
+                if not decisions:
+                    log.info(f"[{tf} | {latest_closed_time} IST] Closed. Active Zones: {len(strat.zones)} | Position Open: {strat.position is not None}")
 
-                    log.info(f"🛑 [{tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
-                    log.info(f"    Trade PnL: ₹{pnl_inr:+.2f} INR | Updated Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} INR")
+                for d in decisions:
+                    action = d["action"]
+
+                    if action == "open":
+                        qty = d["qty"]
+                        log.info(f"🚨 [{tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
+                        log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
+                        log.info(f"    Size: {qty} BTC (Risk Capped at Exactly ₹{RISK_PER_TRADE_INR:.2f} INR)")
+
+                        with STATE_LOCK:
+                            BOT_STATE["total_signals"] += 1
+                            BOT_STATE["active_positions"][tf] = {
+                                "direction": d["direction"],
+                                "entry_usd": f"${d['entry']:,.2f}",
+                                "stop_usd": f"${d['stop']:,.2f}",
+                                "target_usd": f"${d['target']:,.2f}",
+                                "rr": d["rr"],
+                                "qty": qty,
+                                "time": d["candle_time"]
+                            }
+                            BOT_STATE["recent_decisions"].append(d)
+                            if len(BOT_STATE["recent_decisions"]) > 50:
+                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+
+                    elif action == "trail":
+                        log.info(f"🛡️ [{tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
+                        with STATE_LOCK:
+                            if tf in BOT_STATE["active_positions"] and BOT_STATE["active_positions"][tf]:
+                                BOT_STATE["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
+                            BOT_STATE["recent_decisions"].append(d)
+                            if len(BOT_STATE["recent_decisions"]) > 50:
+                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+
+                    elif action == "close":
+                        pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
+                        pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
+                        d["pnl_inr"] = pnl_inr
+
+                        with STATE_LOCK:
+                            BOT_STATE["paper_balance_inr"] += pnl_inr
+                            BOT_STATE["total_pnl_inr"] += pnl_inr
+                            BOT_STATE["total_trades_closed"] += 1
+                            BOT_STATE["active_positions"][tf] = None
+                            BOT_STATE["recent_decisions"].append(d)
+                            if len(BOT_STATE["recent_decisions"]) > 50:
+                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+
+                        log.info(f"🛑 [{tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
+                        log.info(f"    Trade PnL: ₹{pnl_inr:+.2f} INR | Updated Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} INR")
+
+        except Exception as loop_err:
+            log.exception(f"Unexpected error in trading loop: {loop_err}")
 
         time.sleep(POLL_SECONDS)
 
