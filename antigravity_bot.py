@@ -10,6 +10,7 @@ Cloud Deployment for Render.com:
   - Strategy: ICT FVG + IFVG + 200 EMA Trend Filter (Indicator V10.3 Logic)
   - Background Flask Keep-Alive on port 10000 (Ping '/' every 10 mins)
   - Persistent-History Engine (Zero phantom replays)
+  - Real Fee Model: CoinDCX Futures Taker Fee (0.075%) + 18% GST on round-trip
 ================================================================================
 """
 
@@ -61,6 +62,17 @@ POLL_SECONDS = 20                   # Polling interval
 PAPER_BALANCE_INR = 5000.0          # Starting Capital in INR
 RISK_PER_TRADE_INR = 200.0         # Risk Per Trade in INR
 USDT_INR_RATE = 90.0                # Live conversion for ₹200 risk calculation
+
+# ------------------------------------------------------------------
+# FEE MODEL (CoinDCX Futures) — added so paper PnL reflects real
+# trading costs, not just raw price movement. Both entry and exit are
+# market orders in this bot, so TAKER fee applies on both legs
+# (round-trip). Indian GST (18%) applies on top of the fee amount
+# itself, per current Indian tax rules on exchange service fees.
+# ------------------------------------------------------------------
+TAKER_FEE_PCT = 0.00075             # 0.075% per leg (market order fill) — CoinDCX standard futures rate
+MAKER_FEE_PCT = 0.00025             # 0.025% per leg (limit order fill)
+GST_ON_FEE_PCT = 0.18               # 18% GST charged on top of the fee amount
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -116,6 +128,8 @@ BOT_STATE = {
     "start_time": time.time(),
     "paper_balance_inr": PAPER_BALANCE_INR,
     "total_pnl_inr": 0.0,
+    "total_gross_pnl_inr": 0.0,
+    "total_fees_inr": 0.0,
     "last_poll_time": None,
     "last_candle_times": {tf: None for tf in TIMEFRAMES},
     "active_zones": {tf: 0 for tf in TIMEFRAMES},
@@ -426,7 +440,8 @@ class FVGStrategy:
                         min_target = entry + risk * MIN_RR
                         target = float(recent_high) if (not np.isnan(recent_high) and recent_high > min_target) else float(min_target)
                         actual_rr = float((target - entry) / risk)
-                        if actual_rr >= MIN_RR:
+                        # -1e-9 tolerance prevents IEEE-754 floating point precision edge-case rejects (e.g. 1.4999999999999925)
+                        if actual_rr >= MIN_RR - 1e-9:
                             qty = round(risk_usd / risk, 6)
                             self.position = Position(1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
@@ -447,7 +462,8 @@ class FVGStrategy:
                         min_target = entry - risk * MIN_RR
                         target = float(recent_low) if (not np.isnan(recent_low) and recent_low < min_target) else float(min_target)
                         actual_rr = float((entry - target) / risk)
-                        if actual_rr >= MIN_RR:
+                        # -1e-9 tolerance prevents IEEE-754 floating point precision edge-case rejects
+                        if actual_rr >= MIN_RR - 1e-9:
                             qty = round(risk_usd / risk, 6)
                             self.position = Position(-1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
@@ -479,6 +495,8 @@ def health():
             "timeframes": TIMEFRAMES,
             "paper_balance_inr": round(BOT_STATE["paper_balance_inr"], 2),
             "total_pnl_inr": round(BOT_STATE["total_pnl_inr"], 2),
+            "total_gross_pnl_inr": round(BOT_STATE["total_gross_pnl_inr"], 2),
+            "total_fees_inr": round(BOT_STATE["total_fees_inr"], 2),
             "risk_per_trade_inr": RISK_PER_TRADE_INR,
             "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
             "last_candle_times": BOT_STATE["last_candle_times"],
@@ -506,6 +524,7 @@ def run_trading_bot():
     log.info(f"ANTIGRAVITY BOT RUNNING ON BINANCE {SYMBOL} @ {TIMEFRAMES}")
     log.info(f"Chart Feed: 100% TradingView BINANCE:BTCUSDT Match")
     log.info(f"Account: ₹{PAPER_BALANCE_INR:,.2f} INR | Fixed Risk: ₹{RISK_PER_TRADE_INR:,.2f} INR per trade")
+    log.info(f"Fee Model: CoinDCX Futures Taker {TAKER_FEE_PCT*100:.3f}% + {GST_ON_FEE_PCT*100:.0f}% GST")
     log.info("=" * 65)
 
     while True:
@@ -585,12 +604,28 @@ def run_trading_bot():
 
                     elif action == "close":
                         pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
-                        pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
-                        d["pnl_inr"] = pnl_inr
+                        gross_pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
+
+                        # FEE CALCULATION: both entry and exit are market
+                        # (taker) orders, so taker fee applies on BOTH legs'
+                        # notional value, plus 18% GST on the fee amount.
+                        entry_notional_usd = d["qty"] * d["entry"]
+                        exit_notional_usd = d["qty"] * d["price"]
+                        fee_usd = (entry_notional_usd + exit_notional_usd) * TAKER_FEE_PCT
+                        fee_usd_with_gst = fee_usd * (1 + GST_ON_FEE_PCT)
+                        fee_inr = round(fee_usd_with_gst * USDT_INR_RATE, 2)
+
+                        net_pnl_inr = round(gross_pnl_inr - fee_inr, 2)
+
+                        d["gross_pnl_inr"] = gross_pnl_inr
+                        d["fee_inr"] = fee_inr
+                        d["pnl_inr"] = net_pnl_inr  # kept as "pnl_inr" so existing consumers of recent_decisions still work, but it's now NET
 
                         with STATE_LOCK:
-                            BOT_STATE["paper_balance_inr"] += pnl_inr
-                            BOT_STATE["total_pnl_inr"] += pnl_inr
+                            BOT_STATE["paper_balance_inr"] += net_pnl_inr
+                            BOT_STATE["total_pnl_inr"] += net_pnl_inr
+                            BOT_STATE["total_gross_pnl_inr"] += gross_pnl_inr
+                            BOT_STATE["total_fees_inr"] += fee_inr
                             BOT_STATE["total_trades_closed"] += 1
                             BOT_STATE["active_positions"][tf] = None
                             BOT_STATE["recent_decisions"].append(d)
@@ -598,7 +633,8 @@ def run_trading_bot():
                                 BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
 
                         log.info(f"🛑 [{tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
-                        log.info(f"    Trade PnL: ₹{pnl_inr:+.2f} INR | Updated Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} INR")
+                        log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee (incl. GST): ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
+                        log.info(f"    Updated Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} INR")
 
         except Exception as loop_err:
             log.exception(f"Unexpected error in trading loop: {loop_err}")
