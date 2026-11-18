@@ -70,8 +70,8 @@ USDT_INR_RATE = 90.0                # Live conversion for ₹200 risk calculatio
 # (round-trip). Indian GST (18%) applies on top of the fee amount
 # itself, per current Indian tax rules on exchange service fees.
 # ------------------------------------------------------------------
-TAKER_FEE_PCT = 0.00075             # 0.075% per leg (market order fill) — CoinDCX standard futures rate
-MAKER_FEE_PCT = 0.00025             # 0.025% per leg (limit order fill)
+TAKER_FEE_PCT = 0.0005              # 0.05% per leg (market order fill) — CoinDCX official standard futures rate
+MAKER_FEE_PCT = 0.0002              # 0.02% per leg (limit order fill)
 GST_ON_FEE_PCT = 0.18               # 18% GST charged on top of the fee amount
 
 PORT = int(os.environ.get("PORT", 10000))
