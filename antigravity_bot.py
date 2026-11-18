@@ -139,6 +139,57 @@ BOT_STATE = {
     "recent_decisions": []
 }
 STATE_LOCK = threading.Lock()
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
+
+def load_persisted_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                saved = json.load(f)
+            with STATE_LOCK:
+                if "start_time" in saved:
+                    BOT_STATE["start_time"] = saved["start_time"]
+                if "paper_balance_inr" in saved:
+                    BOT_STATE["paper_balance_inr"] = float(saved["paper_balance_inr"])
+                if "total_pnl_inr" in saved:
+                    BOT_STATE["total_pnl_inr"] = float(saved["total_pnl_inr"])
+                if "total_gross_pnl_inr" in saved:
+                    BOT_STATE["total_gross_pnl_inr"] = float(saved["total_gross_pnl_inr"])
+                if "total_fees_inr" in saved:
+                    BOT_STATE["total_fees_inr"] = float(saved["total_fees_inr"])
+                if "total_signals" in saved:
+                    BOT_STATE["total_signals"] = int(saved["total_signals"])
+                if "total_trades_closed" in saved:
+                    BOT_STATE["total_trades_closed"] = int(saved["total_trades_closed"])
+                if "recent_decisions" in saved and isinstance(saved["recent_decisions"], list):
+                    BOT_STATE["recent_decisions"] = saved["recent_decisions"]
+            log.info(
+                f"💾 [STATE RESTORED] Loaded from {STATE_FILE}: "
+                f"Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} | Net PnL: ₹{BOT_STATE['total_pnl_inr']:,.2f} | "
+                f"Trades Closed: {BOT_STATE['total_trades_closed']}"
+            )
+        except Exception as e:
+            log.warning(f"Could not load state from {STATE_FILE}: {e}")
+
+def save_persisted_state():
+    with STATE_LOCK:
+        data = {
+            "start_time": BOT_STATE["start_time"],
+            "paper_balance_inr": round(BOT_STATE["paper_balance_inr"], 2),
+            "total_pnl_inr": round(BOT_STATE["total_pnl_inr"], 2),
+            "total_gross_pnl_inr": round(BOT_STATE["total_gross_pnl_inr"], 2),
+            "total_fees_inr": round(BOT_STATE["total_fees_inr"], 2),
+            "total_signals": BOT_STATE["total_signals"],
+            "total_trades_closed": BOT_STATE["total_trades_closed"],
+            "recent_decisions": BOT_STATE["recent_decisions"][-50:]
+        }
+    try:
+        tmp_file = STATE_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_file, STATE_FILE)
+    except Exception as e:
+        log.warning(f"Could not save state to {STATE_FILE}: {e}")
 
 # ==============================================================================
 # BINANCE PUBLIC MARKET DATA CLIENT (Exact TradingView Candles)
@@ -516,6 +567,7 @@ def run_flask_app():
 # MAIN MULTI-TIMEFRAME ENGINE
 # ============================================================
 def run_trading_bot():
+    load_persisted_state()
     client = BinanceDataClient()
     engines = {tf: FVGStrategy(tf) for tf in TIMEFRAMES}
     last_candle_times = {tf: None for tf in TIMEFRAMES}
@@ -592,6 +644,7 @@ def run_trading_bot():
                             BOT_STATE["recent_decisions"].append(d)
                             if len(BOT_STATE["recent_decisions"]) > 50:
                                 BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+                        save_persisted_state()
 
                     elif action == "trail":
                         log.info(f"🛡️ [{tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
@@ -601,6 +654,7 @@ def run_trading_bot():
                             BOT_STATE["recent_decisions"].append(d)
                             if len(BOT_STATE["recent_decisions"]) > 50:
                                 BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+                        save_persisted_state()
 
                     elif action == "close":
                         pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
@@ -631,6 +685,7 @@ def run_trading_bot():
                             BOT_STATE["recent_decisions"].append(d)
                             if len(BOT_STATE["recent_decisions"]) > 50:
                                 BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
+                        save_persisted_state()
 
                         log.info(f"🛑 [{tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
                         log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee (incl. GST): ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
