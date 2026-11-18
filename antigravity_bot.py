@@ -1,16 +1,20 @@
 """
 ================================================================================
-ANTIGRAVITY BOT — DIRECT BINANCE BTC/USDT CANDLES + INR CAPITAL & RISK
+ANTIGRAVITY BOT — DUAL PARALLEL MULTI-ASSET ENGINE (BTC/USDT + GOLD OANDA)
 ================================================================================
 Cloud Deployment for Render.com:
-  - Chart Engine: Binance Public API (100% 1:1 Match with TradingView BINANCE:BTCUSDT)
-  - Timeframes: 5m, 15m, 30m simultaneously monitored
-  - Capital & Risk: ₹5,000 INR Paper Balance | Strict ₹200 INR Risk per trade
+  - Asset 1: BTCUSDT (Binance Public API — 100% TradingView Match)
+    * Capital: ₹5,000 INR (Preserved & grown from previous trades)
+    * Fee: 0.05% Taker + 18% GST (CoinDCX Futures)
+  - Asset 2: XAUUSD / Gold (OANDA:XAUUSD via TradingView)
+    * Capital: ₹5,000 INR (Independent initial balance)
+    * Fee: 0.001 (0.1% Taker) + 18% GST
+  - Timeframes: 5m, 15m, 30m monitored in parallel for BOTH pairs
+  - Fixed Risk: Strictly ₹200 INR per trade per pair
   - Trailing Stop: 50% TP -> Cost-to-Cost (BE), then +1R trailing milestones
   - Strategy: ICT FVG + IFVG + 200 EMA Trend Filter (Indicator V10.3 Logic)
-  - Background Flask Keep-Alive on port 10000 (Ping '/' every 10 mins)
-  - Persistent-History Engine (Zero phantom replays)
-  - Real Fee Model: CoinDCX Futures Taker Fee (0.075%) + 18% GST on round-trip
+  - Full State Persistence: bot_state.json across server restarts & redeploys
+  - Flask Keep-Alive on port 10000 (/ and /health endpoints)
 ================================================================================
 """
 
@@ -25,11 +29,18 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
 
+# Ensure system timezone is IST for consistent datetime handling
+os.environ["TZ"] = "Asia/Kolkata"
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import pytz
 import requests
 import numpy as np
 import pandas as pd
 from flask import Flask, jsonify
+
+from tvDatafeed import TvDatafeed, Interval
 
 # ==============================================================================
 # LOGGING SETUP (IST Timestamps)
@@ -52,29 +63,38 @@ logger.handlers = [handler]
 log = logger
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION & MULTI-PAIR SETUP
 # ==============================================================================
 DRY_RUN = True
-SYMBOL = "BTCUSDT"                  # Official Binance BTC/USDT Pair
-TIMEFRAMES = ["5m", "15m", "30m"]   # Multi-Timeframe
-POLL_SECONDS = 20                   # Polling interval
-
-PAPER_BALANCE_INR = 5000.0          # Starting Capital in INR
-RISK_PER_TRADE_INR = 200.0         # Risk Per Trade in INR
-USDT_INR_RATE = 90.0                # Live conversion for ₹200 risk calculation
-
-# ------------------------------------------------------------------
-# FEE MODEL (CoinDCX Futures) — added so paper PnL reflects real
-# trading costs, not just raw price movement. Both entry and exit are
-# market orders in this bot, so TAKER fee applies on both legs
-# (round-trip). Indian GST (18%) applies on top of the fee amount
-# itself, per current Indian tax rules on exchange service fees.
-# ------------------------------------------------------------------
-TAKER_FEE_PCT = 0.0005              # 0.05% per leg (market order fill) — CoinDCX official standard futures rate
-MAKER_FEE_PCT = 0.0002              # 0.02% per leg (limit order fill)
-GST_ON_FEE_PCT = 0.18               # 18% GST charged on top of the fee amount
-
+POLL_SECONDS = 20
+USDT_INR_RATE = 90.0
+GST_ON_FEE_PCT = 0.18
 PORT = int(os.environ.get("PORT", 10000))
+
+PAIRS_CONFIG = {
+    "BTCUSDT": {
+        "name": "BTCUSDT",
+        "label": "Bitcoin / TetherUS",
+        "chart_feed": "Binance BTCUSDT (Exact TradingView Match)",
+        "client_type": "binance",
+        "starting_balance_inr": 5000.0,
+        "risk_per_trade_inr": 200.0,
+        "taker_fee_pct": 0.0005,       # 0.05% CoinDCX Futures standard rate
+        "timeframes": ["5m", "15m", "30m"],
+        "qty_precision": 6,
+    },
+    "XAUUSD": {
+        "name": "XAUUSD",
+        "label": "Gold / US Dollar",
+        "chart_feed": "OANDA:XAUUSD (TradingView OANDA Chart)",
+        "client_type": "oanda",
+        "starting_balance_inr": 5000.0,
+        "risk_per_trade_inr": 200.0,
+        "taker_fee_pct": 0.001,        # 0.1% user-specified Gold fee rate
+        "timeframes": ["5m", "15m", "30m"],
+        "qty_precision": 4,
+    }
+}
 
 # Strategy Parameters (ICT FVG + IFVG PRO V10.3)
 ATR_LEN = 14
@@ -124,19 +144,32 @@ class Position:
     sl_moved_to_be: bool = False
     locked_r: float = 0.0
 
+# ==============================================================================
+# STATE & PERSISTENCE
+# ==============================================================================
 BOT_STATE = {
     "start_time": time.time(),
-    "paper_balance_inr": PAPER_BALANCE_INR,
-    "total_pnl_inr": 0.0,
-    "total_gross_pnl_inr": 0.0,
-    "total_fees_inr": 0.0,
     "last_poll_time": None,
-    "last_candle_times": {tf: None for tf in TIMEFRAMES},
-    "active_zones": {tf: 0 for tf in TIMEFRAMES},
-    "active_positions": {},
-    "total_signals": 0,
-    "total_trades_closed": 0,
-    "recent_decisions": []
+    "pairs": {
+        sym: {
+            "symbol": sym,
+            "label": cfg["label"],
+            "chart_feed": cfg["chart_feed"],
+            "paper_balance_inr": cfg["starting_balance_inr"],
+            "total_pnl_inr": 0.0,
+            "total_gross_pnl_inr": 0.0,
+            "total_fees_inr": 0.0,
+            "risk_per_trade_inr": cfg["risk_per_trade_inr"],
+            "taker_fee_pct": cfg["taker_fee_pct"],
+            "last_candle_times": {tf: None for tf in cfg["timeframes"]},
+            "active_zones": {tf: 0 for tf in cfg["timeframes"]},
+            "active_positions": {tf: None for tf in cfg["timeframes"]},
+            "total_signals": 0,
+            "total_trades_closed": 0,
+            "recent_decisions": []
+        }
+        for sym, cfg in PAIRS_CONFIG.items()
+    }
 }
 STATE_LOCK = threading.Lock()
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
@@ -149,24 +182,32 @@ def load_persisted_state():
             with STATE_LOCK:
                 if "start_time" in saved:
                     BOT_STATE["start_time"] = saved["start_time"]
-                if "paper_balance_inr" in saved:
-                    BOT_STATE["paper_balance_inr"] = float(saved["paper_balance_inr"])
-                if "total_pnl_inr" in saved:
-                    BOT_STATE["total_pnl_inr"] = float(saved["total_pnl_inr"])
-                if "total_gross_pnl_inr" in saved:
-                    BOT_STATE["total_gross_pnl_inr"] = float(saved["total_gross_pnl_inr"])
-                if "total_fees_inr" in saved:
-                    BOT_STATE["total_fees_inr"] = float(saved["total_fees_inr"])
-                if "total_signals" in saved:
-                    BOT_STATE["total_signals"] = int(saved["total_signals"])
-                if "total_trades_closed" in saved:
-                    BOT_STATE["total_trades_closed"] = int(saved["total_trades_closed"])
-                if "recent_decisions" in saved and isinstance(saved["recent_decisions"], list):
-                    BOT_STATE["recent_decisions"] = saved["recent_decisions"]
+
+                # Handle multi-pair format
+                if "pairs" in saved and isinstance(saved["pairs"], dict):
+                    for sym, p_saved in saved["pairs"].items():
+                        if sym in BOT_STATE["pairs"]:
+                            p_curr = BOT_STATE["pairs"][sym]
+                            for key in ["paper_balance_inr", "total_pnl_inr", "total_gross_pnl_inr",
+                                        "total_fees_inr", "total_signals", "total_trades_closed"]:
+                                if key in p_saved:
+                                    p_curr[key] = float(p_saved[key]) if "total_" in key or "balance" in key or "fees" in key else int(p_saved[key])
+                            if "recent_decisions" in p_saved and isinstance(p_saved["recent_decisions"], list):
+                                p_curr["recent_decisions"] = p_saved["recent_decisions"]
+                else:
+                    # Legacy single-pair format migration into BTCUSDT
+                    p_btc = BOT_STATE["pairs"]["BTCUSDT"]
+                    for key in ["paper_balance_inr", "total_pnl_inr", "total_gross_pnl_inr",
+                                "total_fees_inr", "total_signals", "total_trades_closed"]:
+                        if key in saved:
+                            p_btc[key] = float(saved[key]) if "total_" in key or "balance" in key or "fees" in key else int(saved[key])
+                    if "recent_decisions" in saved and isinstance(saved["recent_decisions"], list):
+                        p_btc["recent_decisions"] = saved["recent_decisions"]
+
             log.info(
-                f"💾 [STATE RESTORED] Loaded from {STATE_FILE}: "
-                f"Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} | Net PnL: ₹{BOT_STATE['total_pnl_inr']:,.2f} | "
-                f"Trades Closed: {BOT_STATE['total_trades_closed']}"
+                f"💾 [STATE RESTORED] State loaded from {STATE_FILE} | "
+                f"BTC: ₹{BOT_STATE['pairs']['BTCUSDT']['paper_balance_inr']:,.2f} ({BOT_STATE['pairs']['BTCUSDT']['total_trades_closed']} trades) | "
+                f"GOLD: ₹{BOT_STATE['pairs']['XAUUSD']['paper_balance_inr']:,.2f} ({BOT_STATE['pairs']['XAUUSD']['total_trades_closed']} trades)"
             )
         except Exception as e:
             log.warning(f"Could not load state from {STATE_FILE}: {e}")
@@ -175,13 +216,18 @@ def save_persisted_state():
     with STATE_LOCK:
         data = {
             "start_time": BOT_STATE["start_time"],
-            "paper_balance_inr": round(BOT_STATE["paper_balance_inr"], 2),
-            "total_pnl_inr": round(BOT_STATE["total_pnl_inr"], 2),
-            "total_gross_pnl_inr": round(BOT_STATE["total_gross_pnl_inr"], 2),
-            "total_fees_inr": round(BOT_STATE["total_fees_inr"], 2),
-            "total_signals": BOT_STATE["total_signals"],
-            "total_trades_closed": BOT_STATE["total_trades_closed"],
-            "recent_decisions": BOT_STATE["recent_decisions"][-50:]
+            "pairs": {
+                sym: {
+                    "paper_balance_inr": round(p["paper_balance_inr"], 2),
+                    "total_pnl_inr": round(p["total_pnl_inr"], 2),
+                    "total_gross_pnl_inr": round(p["total_gross_pnl_inr"], 2),
+                    "total_fees_inr": round(p["total_fees_inr"], 2),
+                    "total_signals": p["total_signals"],
+                    "total_trades_closed": p["total_trades_closed"],
+                    "recent_decisions": p["recent_decisions"][-50:]
+                }
+                for sym, p in BOT_STATE["pairs"].items()
+            }
         }
     try:
         tmp_file = STATE_FILE + ".tmp"
@@ -192,10 +238,10 @@ def save_persisted_state():
         log.warning(f"Could not save state to {STATE_FILE}: {e}")
 
 # ==============================================================================
-# BINANCE PUBLIC MARKET DATA CLIENT (Exact TradingView Candles)
+# MARKET DATA CLIENT 1: BINANCE PUBLIC API (FOR BTCUSDT)
 # ==============================================================================
 class BinanceDataClient:
-    """Fetches exact candles directly from Binance Public Market Data APIs (Zero KYC, No API Key needed)."""
+    """Fetches exact candles directly from Binance Public Market Data APIs."""
     ENDPOINTS = [
         "https://data-api.binance.vision/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
@@ -214,7 +260,7 @@ class BinanceDataClient:
             try:
                 resp = self.session.get(url, params=params, timeout=10)
                 if resp.status_code == 451:
-                    continue  # Geo-restricted on this host/region; try next mirror
+                    continue
                 resp.raise_for_status()
                 raw_data = resp.json()
                 break
@@ -224,21 +270,63 @@ class BinanceDataClient:
         if raw_data is None:
             raise RuntimeError(f"All Binance endpoints failed ({last_err})")
 
-        # Binance kline format:
-        # [open_time, open, high, low, close, volume, close_time, ...]
         df = pd.DataFrame(raw_data)
         df = df.iloc[:, [0, 1, 2, 3, 4, 5]]
         df.columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
 
-        df["Open"] = df["Open"].astype(float)
-        df["High"] = df["High"].astype(float)
-        df["Low"] = df["Low"].astype(float)
-        df["Close"] = df["Close"].astype(float)
-        df["Volume"] = df["Volume"].astype(float)
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            df[c] = df[c].astype(float)
 
-        # Convert epoch ms to IST Datetime
         df["Time"] = pd.to_datetime(df["Time"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST).dt.tz_localize(None)
         return df.sort_values("Time").reset_index(drop=True)
+
+# ==============================================================================
+# MARKET DATA CLIENT 2: OANDA TRADINGVIEW FEED (FOR XAUUSD / GOLD)
+# ==============================================================================
+class OandaGoldClient:
+    """Fetches exact candles for OANDA:XAUUSD directly from TradingView OANDA feed."""
+    INTERVAL_MAP = {
+        "5m": Interval.in_5_minute,
+        "15m": Interval.in_15_minute,
+        "30m": Interval.in_30_minute
+    }
+
+    def __init__(self):
+        self.tv = None
+        self._init_tv()
+        self.last_cache: Dict[str, pd.DataFrame] = {}
+
+    def _init_tv(self):
+        try:
+            self.tv = TvDatafeed()
+        except Exception:
+            self.tv = None
+
+    def get_candles(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+        tv_interval = self.INTERVAL_MAP.get(interval, Interval.in_5_minute)
+
+        for attempt in range(3):
+            try:
+                if self.tv is None:
+                    self._init_tv()
+                raw_df = self.tv.get_hist(symbol="XAUUSD", exchange="OANDA", interval=tv_interval, n_bars=limit)
+                if raw_df is not None and len(raw_df) >= 30:
+                    df = raw_df.reset_index()[["datetime", "open", "high", "low", "close", "volume"]]
+                    df.columns = ["Time", "Open", "High", "Low", "Close", "Volume"]
+                    for col in ["Open", "High", "Low", "Close", "Volume"]:
+                        df[col] = df[col].astype(float)
+                    df["Time"] = pd.to_datetime(df["Time"])
+                    df = df.sort_values("Time").reset_index(drop=True)
+                    self.last_cache[interval] = df
+                    return df
+            except Exception:
+                pass
+            self._init_tv()
+            time.sleep(1)
+
+        if interval in self.last_cache:
+            return self.last_cache[interval]
+        raise RuntimeError(f"Failed to fetch OANDA:XAUUSD {interval} candles after 3 attempts")
 
 # ==============================================================================
 # STRATEGY ENGINE (ICT FVG + IFVG + 200 EMA + TRAILING STOP)
@@ -334,7 +422,7 @@ class FVGStrategy:
             "bull_score": bull_score, "bear_score": bear_score, "n": n
         }
 
-    def step(self, df: pd.DataFrame) -> List[dict]:
+    def step(self, df: pd.DataFrame, risk_inr: float = 200.0, qty_prec: int = 6) -> List[dict]:
         if self.history is None:
             self.history = df.copy().reset_index(drop=True)
         else:
@@ -477,7 +565,7 @@ class FVGStrategy:
                 recent_low = np.min(l[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
                 trend_ok_long = (not USE_TREND_FILTER) or (c[i] > ema_trend[i])
                 trend_ok_short = (not USE_TREND_FILTER) or (c[i] < ema_trend[i])
-                risk_usd = RISK_PER_TRADE_INR / USDT_INR_RATE
+                risk_usd = risk_inr / USDT_INR_RATE
 
                 if selected_long is not None and trend_ok_long:
                     bottom, top, score, rb = selected_long
@@ -491,9 +579,9 @@ class FVGStrategy:
                         min_target = entry + risk * MIN_RR
                         target = float(recent_high) if (not np.isnan(recent_high) and recent_high > min_target) else float(min_target)
                         actual_rr = float((target - entry) / risk)
-                        # -1e-9 tolerance prevents IEEE-754 floating point precision edge-case rejects (e.g. 1.4999999999999925)
+                        # -1e-9 tolerance prevents IEEE-754 precision rejects
                         if actual_rr >= MIN_RR - 1e-9:
-                            qty = round(risk_usd / risk, 6)
+                            qty = round(risk_usd / risk, qty_prec)
                             self.position = Position(1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
                                 "action": "open", "direction": "LONG", "entry": entry, "stop": stop,
@@ -513,9 +601,8 @@ class FVGStrategy:
                         min_target = entry - risk * MIN_RR
                         target = float(recent_low) if (not np.isnan(recent_low) and recent_low < min_target) else float(min_target)
                         actual_rr = float((entry - target) / risk)
-                        # -1e-9 tolerance prevents IEEE-754 floating point precision edge-case rejects
                         if actual_rr >= MIN_RR - 1e-9:
-                            qty = round(risk_usd / risk, 6)
+                            qty = round(risk_usd / risk, qty_prec)
                             self.position = Position(-1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
                             decisions.append({
                                 "action": "open", "direction": "SHORT", "entry": entry, "stop": stop,
@@ -534,29 +621,61 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 @app.route("/", methods=["GET"])
 def keep_alive():
-    return "Antigravity Binance BTC/USDT Bot Online", 200
+    return "Antigravity Multi-Asset (BTC + GOLD) Bot Online", 200
 
 @app.route("/health", methods=["GET"])
 def health():
     with STATE_LOCK:
+        btc_p = BOT_STATE["pairs"]["BTCUSDT"]
+        gold_p = BOT_STATE["pairs"]["XAUUSD"]
+
+        combined_bal = round(btc_p["paper_balance_inr"] + gold_p["paper_balance_inr"], 2)
+        combined_pnl = round(btc_p["total_pnl_inr"] + gold_p["total_pnl_inr"], 2)
+        combined_gross = round(btc_p["total_gross_pnl_inr"] + gold_p["total_gross_pnl_inr"], 2)
+        combined_fees = round(btc_p["total_fees_inr"] + gold_p["total_fees_inr"], 2)
+        combined_signals = btc_p["total_signals"] + gold_p["total_signals"]
+        combined_closed = btc_p["total_trades_closed"] + gold_p["total_trades_closed"]
+
         data = {
             "status": "online",
-            "bot": "Antigravity Binance BTC/USDT Engine",
-            "chart_feed": f"Binance {SYMBOL} (Exact TradingView Match)",
-            "timeframes": TIMEFRAMES,
-            "paper_balance_inr": round(BOT_STATE["paper_balance_inr"], 2),
-            "total_pnl_inr": round(BOT_STATE["total_pnl_inr"], 2),
-            "total_gross_pnl_inr": round(BOT_STATE["total_gross_pnl_inr"], 2),
-            "total_fees_inr": round(BOT_STATE["total_fees_inr"], 2),
-            "risk_per_trade_inr": RISK_PER_TRADE_INR,
+            "bot": "Antigravity Dual Multi-Asset Engine (BTC/USDT + GOLD OANDA)",
             "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-            "last_candle_times": BOT_STATE["last_candle_times"],
-            "active_zones": BOT_STATE["active_zones"],
-            "active_positions": BOT_STATE["active_positions"],
-            "total_signals": BOT_STATE["total_signals"],
-            "total_trades_closed": BOT_STATE["total_trades_closed"],
             "uptime_hours": round((time.time() - BOT_STATE["start_time"]) / 3600.0, 2),
-            "recent_decisions": BOT_STATE["recent_decisions"][-10:]
+            "combined_balance_inr": combined_bal,
+            "combined_net_pnl_inr": combined_pnl,
+            "combined_gross_pnl_inr": combined_gross,
+            "combined_fees_inr": combined_fees,
+            "combined_signals": combined_signals,
+            "combined_trades_closed": combined_closed,
+            "pairs": {
+                sym: {
+                    "symbol": sym,
+                    "label": p["label"],
+                    "chart_feed": p["chart_feed"],
+                    "paper_balance_inr": round(p["paper_balance_inr"], 2),
+                    "total_pnl_inr": round(p["total_pnl_inr"], 2),
+                    "total_gross_pnl_inr": round(p["total_gross_pnl_inr"], 2),
+                    "total_fees_inr": round(p["total_fees_inr"], 2),
+                    "fee_rate": f"{p['taker_fee_pct']*100:.3f}% Taker + 18% GST",
+                    "risk_per_trade_inr": p["risk_per_trade_inr"],
+                    "active_zones": p["active_zones"],
+                    "active_positions": p["active_positions"],
+                    "last_candle_times": p["last_candle_times"],
+                    "total_signals": p["total_signals"],
+                    "total_trades_closed": p["total_trades_closed"],
+                    "recent_decisions": p["recent_decisions"][-10:]
+                }
+                for sym, p in BOT_STATE["pairs"].items()
+            },
+            # Backward-compatible fields mapped to primary pair (BTCUSDT)
+            "paper_balance_inr": round(btc_p["paper_balance_inr"], 2),
+            "total_pnl_inr": round(btc_p["total_pnl_inr"], 2),
+            "total_gross_pnl_inr": round(btc_p["total_gross_pnl_inr"], 2),
+            "total_fees_inr": round(btc_p["total_fees_inr"], 2),
+            "risk_per_trade_inr": btc_p["risk_per_trade_inr"],
+            "total_signals": btc_p["total_signals"],
+            "total_trades_closed": btc_p["total_trades_closed"],
+            "recent_decisions": btc_p["recent_decisions"][-10:]
         }
     return jsonify(data), 200
 
@@ -564,132 +683,146 @@ def run_flask_app():
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 # ============================================================
-# MAIN MULTI-TIMEFRAME ENGINE
+# MAIN PARALLEL MULTI-ASSET ENGINE
 # ============================================================
 def run_trading_bot():
     load_persisted_state()
-    client = BinanceDataClient()
-    engines = {tf: FVGStrategy(tf) for tf in TIMEFRAMES}
-    last_candle_times = {tf: None for tf in TIMEFRAMES}
 
-    log.info("=" * 65)
-    log.info(f"ANTIGRAVITY BOT RUNNING ON BINANCE {SYMBOL} @ {TIMEFRAMES}")
-    log.info(f"Chart Feed: 100% TradingView BINANCE:BTCUSDT Match")
-    log.info(f"Account: ₹{PAPER_BALANCE_INR:,.2f} INR | Fixed Risk: ₹{RISK_PER_TRADE_INR:,.2f} INR per trade")
-    log.info(f"Fee Model: CoinDCX Futures Taker {TAKER_FEE_PCT*100:.3f}% + {GST_ON_FEE_PCT*100:.0f}% GST")
-    log.info("=" * 65)
+    clients = {
+        "BTCUSDT": BinanceDataClient(),
+        "XAUUSD": OandaGoldClient()
+    }
+
+    engines = {
+        sym: {tf: FVGStrategy(tf) for tf in cfg["timeframes"]}
+        for sym, cfg in PAIRS_CONFIG.items()
+    }
+
+    last_candle_times = {
+        sym: {tf: None for tf in cfg["timeframes"]}
+        for sym, cfg in PAIRS_CONFIG.items()
+    }
+
+    log.info("=" * 70)
+    log.info("ANTIGRAVITY BOT RUNNING DUAL ASSETS PARALLEL (BTCUSDT + GOLD XAUUSD)")
+    for sym, cfg in PAIRS_CONFIG.items():
+        p_state = BOT_STATE["pairs"][sym]
+        log.info(f"  • {sym} ({cfg['label']}): Feed={cfg['chart_feed']}")
+        log.info(f"    Balance: ₹{p_state['paper_balance_inr']:,.2f} INR | Risk: ₹{cfg['risk_per_trade_inr']:,.2f} | Fee: {cfg['taker_fee_pct']*100:.3f}%")
+    log.info("=" * 70)
 
     while True:
         try:
             with STATE_LOCK:
                 BOT_STATE["last_poll_time"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
-            for tf in TIMEFRAMES:
-                try:
-                    df = client.get_candles(SYMBOL, tf, limit=500)
-                except Exception as e:
-                    log.warning(f"[{tf}] Error fetching candles from Binance: {e}")
-                    continue
+            for sym, cfg in PAIRS_CONFIG.items():
+                client = clients[sym]
+                sym_state = BOT_STATE["pairs"][sym]
+                fee_pct = cfg["taker_fee_pct"]
+                risk_inr = cfg["risk_per_trade_inr"]
+                qty_prec = cfg["qty_precision"]
 
-                if df is None or len(df) < 30:
-                    continue
+                for tf in cfg["timeframes"]:
+                    try:
+                        df = client.get_candles(sym, tf, limit=500)
+                    except Exception as e:
+                        log.warning(f"[{sym} | {tf}] Error fetching candles: {e}")
+                        continue
 
-                latest_closed_time = str(df["Time"].iloc[-2])
-                if latest_closed_time == last_candle_times[tf]:
-                    continue
+                    if df is None or len(df) < 30:
+                        continue
 
-                is_warmup = (last_candle_times[tf] is None)
-                last_candle_times[tf] = latest_closed_time
+                    latest_closed_time = str(df["Time"].iloc[-2])
+                    if latest_closed_time == last_candle_times[sym][tf]:
+                        continue
 
-                df_closed = df.iloc[:-1].reset_index(drop=True)
-                strat = engines[tf]
-                decisions = strat.step(df_closed)
+                    is_warmup = (last_candle_times[sym][tf] is None)
+                    last_candle_times[sym][tf] = latest_closed_time
 
-                with STATE_LOCK:
-                    BOT_STATE["last_candle_times"][tf] = latest_closed_time
-                    BOT_STATE["active_zones"][tf] = len(strat.zones)
+                    df_closed = df.iloc[:-1].reset_index(drop=True)
+                    strat = engines[sym][tf]
+                    decisions = strat.step(df_closed, risk_inr=risk_inr, qty_prec=qty_prec)
 
-                # On startup warmup, build zones/EMA200 state without executing historical days-old trades
-                if is_warmup:
-                    strat.position = None
-                    log.info(
-                        f"[{tf}] Warmed up {len(df_closed)} bars (latest: {latest_closed_time} IST). "
-                        f"Active FVG/IFVG zones: {len(strat.zones)}. Monitoring live..."
-                    )
-                    continue
+                    with STATE_LOCK:
+                        sym_state["last_candle_times"][tf] = latest_closed_time
+                        sym_state["active_zones"][tf] = len(strat.zones)
 
-                if not decisions:
-                    log.info(f"[{tf} | {latest_closed_time} IST] Closed. Active Zones: {len(strat.zones)} | Position Open: {strat.position is not None}")
+                    if is_warmup:
+                        strat.position = None
+                        log.info(
+                            f"[{sym} | {tf}] Warmed up {len(df_closed)} bars (latest: {latest_closed_time} IST). "
+                            f"Active zones: {len(strat.zones)}. Monitoring live..."
+                        )
+                        continue
 
-                for d in decisions:
-                    action = d["action"]
+                    for d in decisions:
+                        action = d["action"]
 
-                    if action == "open":
-                        qty = d["qty"]
-                        log.info(f"🚨 [{tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
-                        log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
-                        log.info(f"    Size: {qty} BTC (Risk Capped at Exactly ₹{RISK_PER_TRADE_INR:.2f} INR)")
+                        if action == "open":
+                            qty = d["qty"]
+                            log.info(f"🚨 [{sym} | {tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
+                            log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
+                            log.info(f"    Size: {qty} ({sym}) | Risk Capped: ₹{risk_inr:.2f} INR")
 
-                        with STATE_LOCK:
-                            BOT_STATE["total_signals"] += 1
-                            BOT_STATE["active_positions"][tf] = {
-                                "direction": d["direction"],
-                                "entry_usd": f"${d['entry']:,.2f}",
-                                "stop_usd": f"${d['stop']:,.2f}",
-                                "target_usd": f"${d['target']:,.2f}",
-                                "rr": d["rr"],
-                                "qty": qty,
-                                "time": d["candle_time"]
-                            }
-                            BOT_STATE["recent_decisions"].append(d)
-                            if len(BOT_STATE["recent_decisions"]) > 50:
-                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
-                        save_persisted_state()
+                            with STATE_LOCK:
+                                sym_state["total_signals"] += 1
+                                sym_state["active_positions"][tf] = {
+                                    "direction": d["direction"],
+                                    "entry_usd": f"${d['entry']:,.2f}",
+                                    "stop_usd": f"${d['stop']:,.2f}",
+                                    "target_usd": f"${d['target']:,.2f}",
+                                    "rr": d["rr"],
+                                    "qty": qty,
+                                    "time": d["candle_time"]
+                                }
+                                sym_state["recent_decisions"].append(d)
+                                if len(sym_state["recent_decisions"]) > 50:
+                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+                            save_persisted_state()
 
-                    elif action == "trail":
-                        log.info(f"🛡️ [{tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
-                        with STATE_LOCK:
-                            if tf in BOT_STATE["active_positions"] and BOT_STATE["active_positions"][tf]:
-                                BOT_STATE["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
-                            BOT_STATE["recent_decisions"].append(d)
-                            if len(BOT_STATE["recent_decisions"]) > 50:
-                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
-                        save_persisted_state()
+                        elif action == "trail":
+                            log.info(f"🛡️ [{sym} | {tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
+                            with STATE_LOCK:
+                                if tf in sym_state["active_positions"] and sym_state["active_positions"][tf]:
+                                    sym_state["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
+                                sym_state["recent_decisions"].append(d)
+                                if len(sym_state["recent_decisions"]) > 50:
+                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+                            save_persisted_state()
 
-                    elif action == "close":
-                        pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
-                        gross_pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
+                        elif action == "close":
+                            pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
+                            gross_pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
 
-                        # FEE CALCULATION: both entry and exit are market
-                        # (taker) orders, so taker fee applies on BOTH legs'
-                        # notional value, plus 18% GST on the fee amount.
-                        entry_notional_usd = d["qty"] * d["entry"]
-                        exit_notional_usd = d["qty"] * d["price"]
-                        fee_usd = (entry_notional_usd + exit_notional_usd) * TAKER_FEE_PCT
-                        fee_usd_with_gst = fee_usd * (1 + GST_ON_FEE_PCT)
-                        fee_inr = round(fee_usd_with_gst * USDT_INR_RATE, 2)
+                            entry_notional_usd = d["qty"] * d["entry"]
+                            exit_notional_usd = d["qty"] * d["price"]
+                            fee_usd = (entry_notional_usd + exit_notional_usd) * fee_pct
+                            fee_usd_with_gst = fee_usd * (1 + GST_ON_FEE_PCT)
+                            fee_inr = round(fee_usd_with_gst * USDT_INR_RATE, 2)
 
-                        net_pnl_inr = round(gross_pnl_inr - fee_inr, 2)
+                            net_pnl_inr = round(gross_pnl_inr - fee_inr, 2)
 
-                        d["gross_pnl_inr"] = gross_pnl_inr
-                        d["fee_inr"] = fee_inr
-                        d["pnl_inr"] = net_pnl_inr  # kept as "pnl_inr" so existing consumers of recent_decisions still work, but it's now NET
+                            d["symbol"] = sym
+                            d["gross_pnl_inr"] = gross_pnl_inr
+                            d["fee_inr"] = fee_inr
+                            d["pnl_inr"] = net_pnl_inr
 
-                        with STATE_LOCK:
-                            BOT_STATE["paper_balance_inr"] += net_pnl_inr
-                            BOT_STATE["total_pnl_inr"] += net_pnl_inr
-                            BOT_STATE["total_gross_pnl_inr"] += gross_pnl_inr
-                            BOT_STATE["total_fees_inr"] += fee_inr
-                            BOT_STATE["total_trades_closed"] += 1
-                            BOT_STATE["active_positions"][tf] = None
-                            BOT_STATE["recent_decisions"].append(d)
-                            if len(BOT_STATE["recent_decisions"]) > 50:
-                                BOT_STATE["recent_decisions"] = BOT_STATE["recent_decisions"][-50:]
-                        save_persisted_state()
+                            with STATE_LOCK:
+                                sym_state["paper_balance_inr"] += net_pnl_inr
+                                sym_state["total_pnl_inr"] += net_pnl_inr
+                                sym_state["total_gross_pnl_inr"] += gross_pnl_inr
+                                sym_state["total_fees_inr"] += fee_inr
+                                sym_state["total_trades_closed"] += 1
+                                sym_state["active_positions"][tf] = None
+                                sym_state["recent_decisions"].append(d)
+                                if len(sym_state["recent_decisions"]) > 50:
+                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+                            save_persisted_state()
 
-                        log.info(f"🛑 [{tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
-                        log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee (incl. GST): ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
-                        log.info(f"    Updated Balance: ₹{BOT_STATE['paper_balance_inr']:,.2f} INR")
+                            log.info(f"🛑 [{sym} | {tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
+                            log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee: ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
+                            log.info(f"    Updated {sym} Balance: ₹{sym_state['paper_balance_inr']:,.2f} INR")
 
         except Exception as loop_err:
             log.exception(f"Unexpected error in trading loop: {loop_err}")

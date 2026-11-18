@@ -1,231 +1,244 @@
 {
   "start_time": 1794404458.378031,
-  "paper_balance_inr": 6410.34,
-  "total_pnl_inr": 1410.34,
-  "total_gross_pnl_inr": 2205.35,
-  "total_fees_inr": 795.01,
-  "total_signals": 10,
-  "total_trades_closed": 10,
-  "recent_decisions": [
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "LONG",
-      "candle_time": "2026-11-12 01:35:00",
-      "entry": 74372.78,
-      "qty": 0.018955,
-      "score": 85.0
+  "pairs": {
+    "BTCUSDT": {
+      "paper_balance_inr": 6410.34,
+      "total_pnl_inr": 1410.34,
+      "total_gross_pnl_inr": 2205.35,
+      "total_fees_inr": 795.01,
+      "total_signals": 10,
+      "total_trades_closed": 10,
+      "recent_decisions": [
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "LONG",
+          "candle_time": "2026-11-12 01:35:00",
+          "entry": 74372.78,
+          "qty": 0.018955,
+          "score": 85.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "LONG",
+          "candle_time": "2026-11-12 01:50:00",
+          "price": 74490.01426665716,
+          "entry": 74372.78,
+          "qty": 0.018955,
+          "reason": "SL/Trailing Stop",
+          "gross_pnl_inr": 200.0,
+          "fee_inr": 149.83,
+          "pnl_inr": 50.17
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-12 18:10:00",
+          "entry": 72992.0,
+          "qty": 0.017231,
+          "score": 80.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-12 18:35:00",
+          "price": 72992.0,
+          "entry": 72992.0,
+          "qty": 0.017231,
+          "reason": "SL/Trailing Stop",
+          "gross_pnl_inr": -0.0,
+          "fee_inr": 133.57,
+          "pnl_inr": -133.57
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-14 14:15:00",
+          "entry": 67155.34,
+          "qty": 0.018057,
+          "score": 80.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-14 15:15:00",
+          "price": 67278.40372337536,
+          "entry": 67155.34,
+          "qty": 0.018057,
+          "reason": "SL/Trailing Stop",
+          "gross_pnl_inr": -199.99,
+          "fee_inr": 128.9,
+          "pnl_inr": -328.89
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-14 21:50:00",
+          "entry": 65650.0,
+          "qty": 0.008691,
+          "score": 80.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-14 22:15:00",
+          "price": 65066.66,
+          "entry": 65650.0,
+          "qty": 0.008691,
+          "reason": "TP",
+          "gross_pnl_inr": 456.28,
+          "fee_inr": 60.32,
+          "pnl_inr": 395.96
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-15 01:15:00",
+          "entry": 65885.76,
+          "qty": 0.00779,
+          "score": 100.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-15 02:20:00",
+          "price": 65000.0,
+          "entry": 65885.76,
+          "qty": 0.00779,
+          "reason": "TP",
+          "gross_pnl_inr": 621.01,
+          "fee_inr": 54.14,
+          "pnl_inr": 566.87
+        },
+        {
+          "action": "open",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-15 06:15:00",
+          "entry": 63877.98,
+          "qty": 0.0041,
+          "score": 80.0
+        },
+        {
+          "action": "close",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-15 06:30:00",
+          "price": 63065.02714296067,
+          "entry": 63877.98,
+          "qty": 0.0041,
+          "reason": "TP",
+          "gross_pnl_inr": 299.98,
+          "fee_inr": 27.64,
+          "pnl_inr": 272.34
+        },
+        {
+          "action": "open",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 01:30:00",
+          "entry": 65117.6,
+          "qty": 0.006342,
+          "score": 100.0
+        },
+        {
+          "action": "close",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 04:30:00",
+          "price": 65467.98499999999,
+          "entry": 65117.6,
+          "qty": 0.006342,
+          "reason": "SL/Trailing Stop",
+          "gross_pnl_inr": -199.99,
+          "fee_inr": 43.98,
+          "pnl_inr": -243.97
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 06:45:00",
+          "entry": 64940.0,
+          "qty": 0.01363,
+          "score": 80.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 06:50:00",
+          "price": 64672.55,
+          "entry": 64940.0,
+          "qty": 0.01363,
+          "reason": "TP",
+          "gross_pnl_inr": 328.08,
+          "fee_inr": 93.81,
+          "pnl_inr": 234.27
+        },
+        {
+          "action": "open",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 20:15:00",
+          "entry": 65586.24,
+          "qty": 0.004715,
+          "score": 100.0
+        },
+        {
+          "action": "close",
+          "tf": "15m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-16 21:15:00",
+          "price": 64643.64,
+          "entry": 65586.24,
+          "qty": 0.004715,
+          "reason": "SL/Trailing Stop",
+          "gross_pnl_inr": 399.99,
+          "fee_inr": 32.61,
+          "pnl_inr": 367.38
+        },
+        {
+          "action": "open",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-17 05:30:00",
+          "entry": 65024.74,
+          "qty": 0.010193,
+          "score": 85.0
+        },
+        {
+          "action": "close",
+          "tf": "5m",
+          "direction": "SHORT",
+          "candle_time": "2026-11-17 05:40:00",
+          "price": 64697.725000000006,
+          "entry": 65024.74,
+          "qty": 0.010193,
+          "reason": "TP",
+          "gross_pnl_inr": 299.99,
+          "fee_inr": 70.21,
+          "pnl_inr": 229.78
+        }
+      ]
     },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "LONG",
-      "candle_time": "2026-11-12 01:50:00",
-      "price": 74490.01426665716,
-      "entry": 74372.78,
-      "qty": 0.018955,
-      "reason": "SL/Trailing Stop",
-      "gross_pnl_inr": 200.0,
-      "fee_inr": 149.83,
-      "pnl_inr": 50.17
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-12 18:10:00",
-      "entry": 72992.0,
-      "qty": 0.017231,
-      "score": 80.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-12 18:35:00",
-      "price": 72992.0,
-      "entry": 72992.0,
-      "qty": 0.017231,
-      "reason": "SL/Trailing Stop",
-      "gross_pnl_inr": -0.0,
-      "fee_inr": 133.57,
-      "pnl_inr": -133.57
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-14 14:15:00",
-      "entry": 67155.34,
-      "qty": 0.018057,
-      "score": 80.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-14 15:15:00",
-      "price": 67278.40372337536,
-      "entry": 67155.34,
-      "qty": 0.018057,
-      "reason": "SL/Trailing Stop",
-      "gross_pnl_inr": -199.99,
-      "fee_inr": 128.9,
-      "pnl_inr": -328.89
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-14 21:50:00",
-      "entry": 65650.0,
-      "qty": 0.008691,
-      "score": 80.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-14 22:15:00",
-      "price": 65066.66,
-      "entry": 65650.0,
-      "qty": 0.008691,
-      "reason": "TP",
-      "gross_pnl_inr": 456.28,
-      "fee_inr": 60.32,
-      "pnl_inr": 395.96
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-15 01:15:00",
-      "entry": 65885.76,
-      "qty": 0.00779,
-      "score": 100.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-15 02:20:00",
-      "price": 65000.0,
-      "entry": 65885.76,
-      "qty": 0.00779,
-      "reason": "TP",
-      "gross_pnl_inr": 621.01,
-      "fee_inr": 54.14,
-      "pnl_inr": 566.87
-    },
-    {
-      "action": "open",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-15 06:15:00",
-      "entry": 63877.98,
-      "qty": 0.0041,
-      "score": 80.0
-    },
-    {
-      "action": "close",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-15 06:30:00",
-      "price": 63065.02714296067,
-      "entry": 63877.98,
-      "qty": 0.0041,
-      "reason": "TP",
-      "gross_pnl_inr": 299.98,
-      "fee_inr": 27.64,
-      "pnl_inr": 272.34
-    },
-    {
-      "action": "open",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 01:30:00",
-      "entry": 65117.6,
-      "qty": 0.006342,
-      "score": 100.0
-    },
-    {
-      "action": "close",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 04:30:00",
-      "price": 65467.98499999999,
-      "entry": 65117.6,
-      "qty": 0.006342,
-      "reason": "SL/Trailing Stop",
-      "gross_pnl_inr": -199.99,
-      "fee_inr": 43.98,
-      "pnl_inr": -243.97
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 06:45:00",
-      "entry": 64940.0,
-      "qty": 0.01363,
-      "score": 80.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 06:50:00",
-      "price": 64672.55,
-      "entry": 64940.0,
-      "qty": 0.01363,
-      "reason": "TP",
-      "gross_pnl_inr": 328.08,
-      "fee_inr": 93.81,
-      "pnl_inr": 234.27
-    },
-    {
-      "action": "open",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 20:15:00",
-      "entry": 65586.24,
-      "qty": 0.004715,
-      "score": 100.0
-    },
-    {
-      "action": "close",
-      "tf": "15m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-16 21:15:00",
-      "price": 64643.64,
-      "entry": 65586.24,
-      "qty": 0.004715,
-      "reason": "SL/Trailing Stop",
-      "gross_pnl_inr": 399.99,
-      "fee_inr": 32.61,
-      "pnl_inr": 367.38
-    },
-    {
-      "action": "open",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-17 05:30:00",
-      "entry": 65024.74,
-      "qty": 0.010193,
-      "score": 85.0
-    },
-    {
-      "action": "close",
-      "tf": "5m",
-      "direction": "SHORT",
-      "candle_time": "2026-11-17 05:40:00",
-      "price": 64697.725000000006,
-      "entry": 65024.74,
-      "qty": 0.010193,
-      "reason": "TP",
-      "gross_pnl_inr": 299.99,
-      "fee_inr": 70.21,
-      "pnl_inr": 229.78
+    "XAUUSD": {
+      "paper_balance_inr": 5000.0,
+      "total_pnl_inr": 0.0,
+      "total_gross_pnl_inr": 0.0,
+      "total_fees_inr": 0.0,
+      "total_signals": 0,
+      "total_trades_closed": 0,
+      "recent_decisions": []
     }
-  ]
+  }
 }
