@@ -72,6 +72,29 @@ USDT_INR_RATE = 90.0
 GST_ON_FEE_PCT = 0.18
 PORT = int(os.environ.get("PORT", 10000))
 
+# ==============================================================================
+# TELEGRAM ALERTS CONFIGURATION
+# ==============================================================================
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "9057799504:AAFVoL2G3nBQ2odg9r8eULuIL2eo2PFZEkQ")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "1808628259")
+
+def send_telegram_alert(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        log.warning(f"Telegram alert delivery failed: {e}")
+
+def notify_telegram_async(text: str):
+    threading.Thread(target=send_telegram_alert, args=(text,), daemon=True).start()
+
 PAIRS_CONFIG = {
     "BTCUSDT": {
         "name": "BTCUSDT",
@@ -783,6 +806,21 @@ def run_trading_bot():
                                     sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
                             save_persisted_state()
 
+                            dir_emoji = "🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT"
+                            trade_no = int(sym_state["total_signals"])
+                            open_msg = (
+                                f"🚨 <b>TRADE OPENED: {sym} (Trade #{trade_no})</b>\n\n"
+                                f"⏱️ <b>Timeframe:</b> {tf}\n"
+                                f"📈 <b>Direction:</b> {dir_emoji}\n"
+                                f"💵 <b>Entry Price:</b> ${d['entry']:,.2f}\n"
+                                f"🛑 <b>Stop Loss:</b> ${d['stop']:,.2f}\n"
+                                f"🎯 <b>Target:</b> ${d['target']:,.2f}\n"
+                                f"⚖️ <b>Target R:R:</b> {d['rr']:.2f} R\n"
+                                f"🛡️ <b>Risk Capped:</b> ₹{risk_inr:,.2f} INR\n"
+                                f"⏰ <b>Candle Time:</b> {d['candle_time']} IST"
+                            )
+                            notify_telegram_async(open_msg)
+
                         elif action == "trail":
                             log.info(f"🛡️ [{sym} | {tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
                             with STATE_LOCK:
@@ -792,6 +830,14 @@ def run_trading_bot():
                                 if len(sym_state["recent_decisions"]) > 50:
                                     sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
                             save_persisted_state()
+
+                            trail_msg = (
+                                f"🛡️ <b>SL TRAILED: {sym} ({tf})</b>\n\n"
+                                f"📌 <b>Reason:</b> {d['reason']}\n"
+                                f"🎯 <b>New Stop Loss:</b> ${d['new_stop']:,.2f}\n"
+                                f"⏰ <b>Time:</b> {d['candle_time']} IST"
+                            )
+                            notify_telegram_async(trail_msg)
 
                         elif action == "close":
                             pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
@@ -825,6 +871,39 @@ def run_trading_bot():
                             log.info(f"🛑 [{sym} | {tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
                             log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee: ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
                             log.info(f"    Updated {sym} Balance: ₹{sym_state['paper_balance_inr']:,.2f} INR")
+
+                            trade_no = int(sym_state["total_trades_closed"])
+                            if d["reason"] == "TP":
+                                outcome_emoji = "🎯 TAKE PROFIT HIT"
+                            elif abs(gross_pnl_inr) < 1.0:
+                                outcome_emoji = "⚪ BREAKEVEN HIT"
+                            elif gross_pnl_inr > 0:
+                                outcome_emoji = "🟢 TRAILING PROFIT HIT"
+                            else:
+                                outcome_emoji = "❌ STOP LOSS HIT"
+
+                            rr_achieved = round(gross_pnl_inr / risk_inr, 2) if risk_inr > 0 else 0.0
+                            sign = "+" if net_pnl_inr > 0 else ""
+
+                            with STATE_LOCK:
+                                btc_b = BOT_STATE["pairs"]["BTCUSDT"]["paper_balance_inr"]
+                                gold_b = BOT_STATE["pairs"]["XAUUSD"]["paper_balance_inr"]
+                                comb_b = round(btc_b + gold_b, 2)
+
+                            close_msg = (
+                                f"🏁 <b>TRADE CLOSED: {sym} (Trade #{trade_no})</b>\n\n"
+                                f"📊 <b>Outcome:</b> {outcome_emoji}\n"
+                                f"⏱️ <b>Timeframe:</b> {tf} ({d['direction']})\n"
+                                f"💵 <b>Entry:</b> ${d['entry']:,.2f} ➡️ <b>Exit:</b> ${d['price']:,.2f}\n"
+                                f"⚖️ <b>R:R Achieved:</b> {sign}{rr_achieved:.2f} R\n"
+                                f"💰 <b>Gross PnL:</b> ₹{gross_pnl_inr:+,.2f} INR\n"
+                                f"🧾 <b>Exchange Fees:</b> ₹{fee_inr:,.2f} INR\n"
+                                f"💵 <b>Net PnL (In Hand):</b> <b>₹{net_pnl_inr:+,.2f} INR</b>\n\n"
+                                f"💼 <b>Updated {sym} Balance:</b> ₹{sym_state['paper_balance_inr']:,.2f} INR\n"
+                                f"💰 <b>Total Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
+                                f"⏰ <b>Close Time:</b> {d['candle_time']} IST"
+                            )
+                            notify_telegram_async(close_msg)
 
         except Exception as loop_err:
             log.exception(f"Unexpected error in trading loop: {loop_err}")
