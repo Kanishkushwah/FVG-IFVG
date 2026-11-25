@@ -13,6 +13,7 @@
       "total_signals": 25,
       "total_trades_closed": 25,
       "active_positions": {
+        "3m": null,
         "5m": null,
         "15m": null,
         "30m": null
@@ -65,6 +66,7 @@
       "total_signals": 10,
       "total_trades_closed": 10,
       "active_positions": {
+        "3m": null,
         "5m": null,
         "15m": null,
         "30m": null

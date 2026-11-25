@@ -115,7 +115,7 @@ PAIRS_CONFIG = {
         "starting_balance_inr": 5000.0,
         "risk_per_trade_inr": 200.0,
         "taker_fee_pct": 0.001,        # 0.1% user-specified Gold fee rate
-        "timeframes": ["5m", "15m", "30m"],
+        "timeframes": ["3m", "5m", "15m", "30m"],
         "qty_precision": 4,
     }
 }
@@ -310,6 +310,7 @@ class BinanceDataClient:
 class OandaGoldClient:
     """Fetches exact candles for OANDA:XAUUSD directly from TradingView OANDA feed."""
     INTERVAL_MAP = {
+        "3m": Interval.in_3_minute,
         "5m": Interval.in_5_minute,
         "15m": Interval.in_15_minute,
         "30m": Interval.in_30_minute
