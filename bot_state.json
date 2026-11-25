@@ -16,7 +16,8 @@
         "3m": null,
         "5m": null,
         "15m": null,
-        "30m": null
+        "30m": null,
+        "1h": null
       },
       "recent_decisions": [
         {
@@ -69,7 +70,8 @@
         "3m": null,
         "5m": null,
         "15m": null,
-        "30m": null
+        "30m": null,
+        "1h": null
       },
       "recent_decisions": [
         {
