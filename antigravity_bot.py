@@ -41,6 +41,7 @@ import pandas as pd
 from flask import Flask, jsonify
 
 from tvDatafeed import TvDatafeed, Interval
+logging.getLogger("tvDatafeed").setLevel(logging.CRITICAL)
 
 # ==============================================================================
 # LOGGING SETUP (IST Timestamps)
@@ -318,11 +319,12 @@ class OandaGoldClient:
                     df["Time"] = pd.to_datetime(df["Time"])
                     df = df.sort_values("Time").reset_index(drop=True)
                     self.last_cache[interval] = df
+                    time.sleep(1.2)
                     return df
             except Exception:
                 pass
+            time.sleep(1.5)
             self._init_tv()
-            time.sleep(1)
 
         if interval in self.last_cache:
             return self.last_cache[interval]
