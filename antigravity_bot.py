@@ -727,8 +727,8 @@ def format_daily_summary(target_date: str) -> str:
     total_fees = sum(t.get("fee_inr", 0.0) for t in trades)
     total_net = sum(t.get("pnl_inr", 0.0) for t in trades)
 
-    net_sign = "+" if total_net > 0 else ""
-    gross_sign = "+" if total_gross > 0 else ""
+    net_str = f"+₹{total_net:,.2f}" if total_net >= 0 else f"-₹{abs(total_net):,.2f}"
+    gross_str = f"+₹{total_gross:,.2f}" if total_gross >= 0 else f"-₹{abs(total_gross):,.2f}"
 
     btc_trades = [t for t in trades if t.get("symbol") == "BTCUSDT"]
     gold_trades = [t for t in trades if t.get("symbol") == "XAUUSD"]
@@ -736,8 +736,11 @@ def format_daily_summary(target_date: str) -> str:
     btc_net = sum(t.get("pnl_inr", 0.0) for t in btc_trades)
     gold_net = sum(t.get("pnl_inr", 0.0) for t in gold_trades)
 
-    btc_sign = "+" if btc_net > 0 else ""
-    gold_sign = "+" if gold_net > 0 else ""
+    btc_net_str = f"+₹{btc_net:,.2f}" if btc_net >= 0 else f"-₹{abs(btc_net):,.2f}"
+    gold_net_str = f"+₹{gold_net:,.2f}" if gold_net >= 0 else f"-₹{abs(gold_net):,.2f}"
+
+    btc_trade_label = f"{len(btc_trades)} Trade" if len(btc_trades) == 1 else f"{len(btc_trades)} Trades"
+    gold_trade_label = f"{len(gold_trades)} Trade" if len(gold_trades) == 1 else f"{len(gold_trades)} Trades"
 
     open_pos_str = f"\n⚠️ <b>Active Open Positions:</b> {', '.join(open_pos_list)}\n" if open_pos_list else ""
 
@@ -749,13 +752,13 @@ def format_daily_summary(target_date: str) -> str:
         f"🟢 <b>Wins:</b> {win_count} ({win_rate:.1f}% Win Rate)\n"
         f"🔴 <b>Losses:</b> {loss_count}\n"
         f"⚪ <b>Breakeven:</b> {be_count}\n\n"
-        f"💰 <b>NET PROFIT COMBINED:</b> <b>{net_sign}₹{total_net:+,.2f} INR</b>\n"
-        f"💵 <b>Gross Profit:</b> {gross_sign}₹{total_gross:+,.2f} INR\n"
+        f"💰 <b>NET PROFIT COMBINED:</b> <b>{net_str} INR</b>\n"
+        f"💵 <b>Gross Profit:</b> {gross_str} INR\n"
         f"🧾 <b>Exchange Fees + GST:</b> ₹{total_fees:,.2f} INR\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>Pair Breakdown:</b>\n"
-        f"• <b>BTC/USDT:</b> {len(btc_trades)} Trades | Net: <b>{btc_sign}₹{btc_net:+,.2f} INR</b>\n"
-        f"• <b>XAUUSD (Gold):</b> {len(gold_trades)} Trades | Net: <b>{gold_sign}₹{gold_net:+,.2f} INR</b>\n"
+        f"• <b>BTC/USDT:</b> {btc_trade_label} | Net: <b>{btc_net_str} INR</b>\n"
+        f"• <b>XAUUSD (Gold):</b> {gold_trade_label} | Net: <b>{gold_net_str} INR</b>\n"
         f"{open_pos_str}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💼 <b>Total Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
