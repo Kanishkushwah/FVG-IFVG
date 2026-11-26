@@ -25,7 +25,7 @@ import json
 import signal
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict, Any
 
@@ -38,7 +38,7 @@ import pytz
 import requests
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from tvDatafeed import TvDatafeed, Interval
 logging.getLogger("tvDatafeed").setLevel(logging.CRITICAL)
@@ -174,6 +174,8 @@ class Position:
 BOT_STATE = {
     "start_time": time.time(),
     "last_poll_time": None,
+    "last_daily_report_date": None,
+    "closed_trades_history": [],
     "pairs": {
         sym: {
             "symbol": sym,
@@ -206,6 +208,10 @@ def load_persisted_state():
             with STATE_LOCK:
                 if "start_time" in saved:
                     BOT_STATE["start_time"] = saved["start_time"]
+                if "last_daily_report_date" in saved:
+                    BOT_STATE["last_daily_report_date"] = saved["last_daily_report_date"]
+                if "closed_trades_history" in saved and isinstance(saved["closed_trades_history"], list):
+                    BOT_STATE["closed_trades_history"] = saved["closed_trades_history"]
 
                 # Handle multi-pair format
                 if "pairs" in saved and isinstance(saved["pairs"], dict):
@@ -228,10 +234,35 @@ def load_persisted_state():
                     if "recent_decisions" in saved and isinstance(saved["recent_decisions"], list):
                         p_btc["recent_decisions"] = saved["recent_decisions"]
 
+                # Auto-backfill closed_trades_history from recent_decisions if empty
+                if not BOT_STATE.get("closed_trades_history"):
+                    BOT_STATE["closed_trades_history"] = []
+                    for sym, p in BOT_STATE["pairs"].items():
+                        for d in p.get("recent_decisions", []):
+                            if d.get("action") == "close":
+                                c_time = d.get("candle_time", "")
+                                d_date = c_time[:10] if len(c_time) >= 10 else datetime.now(IST).strftime("%Y-%m-%d")
+                                BOT_STATE["closed_trades_history"].append({
+                                    "symbol": sym,
+                                    "tf": d.get("tf", "5m"),
+                                    "direction": d.get("direction", "UNKNOWN"),
+                                    "entry": d.get("entry", 0.0),
+                                    "price": d.get("price", 0.0),
+                                    "qty": d.get("qty", 0.0),
+                                    "gross_pnl_inr": d.get("gross_pnl_inr", 0.0),
+                                    "fee_inr": d.get("fee_inr", 0.0),
+                                    "pnl_inr": d.get("pnl_inr", 0.0),
+                                    "reason": d.get("reason", "EXIT"),
+                                    "candle_time": c_time,
+                                    "close_time": c_time,
+                                    "date": d_date
+                                })
+
             log.info(
                 f"💾 [STATE RESTORED] State loaded from {STATE_FILE} | "
                 f"BTC: ₹{BOT_STATE['pairs']['BTCUSDT']['paper_balance_inr']:,.2f} ({BOT_STATE['pairs']['BTCUSDT']['total_trades_closed']} trades) | "
-                f"GOLD: ₹{BOT_STATE['pairs']['XAUUSD']['paper_balance_inr']:,.2f} ({BOT_STATE['pairs']['XAUUSD']['total_trades_closed']} trades)"
+                f"GOLD: ₹{BOT_STATE['pairs']['XAUUSD']['paper_balance_inr']:,.2f} ({BOT_STATE['pairs']['XAUUSD']['total_trades_closed']} trades) | "
+                f"History: {len(BOT_STATE.get('closed_trades_history', []))} trades"
             )
         except Exception as e:
             log.warning(f"Could not load state from {STATE_FILE}: {e}")
@@ -240,6 +271,8 @@ def save_persisted_state():
     with STATE_LOCK:
         data = {
             "start_time": BOT_STATE["start_time"],
+            "last_daily_report_date": BOT_STATE.get("last_daily_report_date"),
+            "closed_trades_history": BOT_STATE.get("closed_trades_history", [])[-500:],
             "pairs": {
                 sym: {
                     "paper_balance_inr": round(p["paper_balance_inr"], 2),
@@ -641,6 +674,124 @@ class FVGStrategy:
         return decisions
 
 # ============================================================
+# DAILY MIDNIGHT TELEGRAM OVERVIEW SCHEDULER & FORMATTER
+# ============================================================
+def format_daily_summary(target_date: str) -> str:
+    with STATE_LOCK:
+        trades = [
+            t for t in BOT_STATE.get("closed_trades_history", [])
+            if t.get("date") == target_date or (t.get("candle_time") and t.get("candle_time")[:10] == target_date)
+        ]
+        btc_b = BOT_STATE["pairs"]["BTCUSDT"]["paper_balance_inr"]
+        gold_b = BOT_STATE["pairs"]["XAUUSD"]["paper_balance_inr"]
+        comb_b = round(btc_b + gold_b, 2)
+
+        open_pos_list = []
+        for s, p_data in BOT_STATE["pairs"].items():
+            for tf_k, pos in p_data.get("active_positions", {}).items():
+                if pos:
+                    open_pos_list.append(f"{s} ({tf_k} {pos.get('direction', '')})")
+
+    try:
+        dt_obj = datetime.strptime(target_date, "%Y-%m-%d")
+        date_display = dt_obj.strftime("%d %b %Y (%A)")
+    except Exception:
+        date_display = target_date
+
+    total_trades = len(trades)
+    if total_trades == 0:
+        msg = (
+            f"📊 <b>DAILY TRADING SUMMARY | ANTIGRAVITY BOT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 <b>Date:</b> {date_display}\n"
+            f"🎯 <b>Total Trades Taken Today:</b> 0\n"
+            f"🟢 <b>Wins:</b> 0\n"
+            f"🔴 <b>Losses:</b> 0\n"
+            f"💰 <b>NET PROFIT COMBINED:</b> ₹0.00 INR\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💼 <b>Current Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
+            f"🚀 <b>Status:</b> Market scanned 24/7 across all timeframes. No setup triggers closed today."
+        )
+        return msg
+
+    wins = [t for t in trades if t.get("pnl_inr", 0) > 0]
+    losses = [t for t in trades if t.get("pnl_inr", 0) < 0]
+    breakeven = [t for t in trades if t.get("pnl_inr", 0) == 0]
+
+    win_count = len(wins)
+    loss_count = len(losses)
+    be_count = len(breakeven)
+    win_rate = (win_count / total_trades) * 100.0
+
+    total_gross = sum(t.get("gross_pnl_inr", 0.0) for t in trades)
+    total_fees = sum(t.get("fee_inr", 0.0) for t in trades)
+    total_net = sum(t.get("pnl_inr", 0.0) for t in trades)
+
+    net_sign = "+" if total_net > 0 else ""
+    gross_sign = "+" if total_gross > 0 else ""
+
+    btc_trades = [t for t in trades if t.get("symbol") == "BTCUSDT"]
+    gold_trades = [t for t in trades if t.get("symbol") == "XAUUSD"]
+
+    btc_net = sum(t.get("pnl_inr", 0.0) for t in btc_trades)
+    gold_net = sum(t.get("pnl_inr", 0.0) for t in gold_trades)
+
+    btc_sign = "+" if btc_net > 0 else ""
+    gold_sign = "+" if gold_net > 0 else ""
+
+    open_pos_str = f"\n⚠️ <b>Active Open Positions:</b> {', '.join(open_pos_list)}\n" if open_pos_list else ""
+
+    msg = (
+        f"📊 <b>DAILY TRADING SUMMARY | ANTIGRAVITY BOT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 <b>Date:</b> {date_display}\n"
+        f"🎯 <b>Total Trades Taken Today:</b> {total_trades}\n"
+        f"🟢 <b>Wins:</b> {win_count} ({win_rate:.1f}% Win Rate)\n"
+        f"🔴 <b>Losses:</b> {loss_count}\n"
+        f"⚪ <b>Breakeven:</b> {be_count}\n\n"
+        f"💰 <b>NET PROFIT COMBINED:</b> <b>{net_sign}₹{total_net:+,.2f} INR</b>\n"
+        f"💵 <b>Gross Profit:</b> {gross_sign}₹{total_gross:+,.2f} INR\n"
+        f"🧾 <b>Exchange Fees + GST:</b> ₹{total_fees:,.2f} INR\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Pair Breakdown:</b>\n"
+        f"• <b>BTC/USDT:</b> {len(btc_trades)} Trades | Net: <b>{btc_sign}₹{btc_net:+,.2f} INR</b>\n"
+        f"• <b>XAUUSD (Gold):</b> {len(gold_trades)} Trades | Net: <b>{gold_sign}₹{gold_net:+,.2f} INR</b>\n"
+        f"{open_pos_str}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 <b>Total Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
+        f"🚀 <b>Engine:</b> Autonomous 24/7 Running"
+    )
+    return msg
+
+
+def run_daily_report_scheduler():
+    """
+    Dedicated background scheduler running in its own thread.
+    Checks IST clock every 10 seconds.
+    At 12:00 AM midnight IST (00:00:00 to 00:05:00 window), it automatically
+    compiles and sends the full daily trading summary for the completed day to Telegram.
+    """
+    log.info("⏰ [DAILY SCHEDULER] Daily Midnight (12:00 AM IST) Telegram overview daemon started.")
+    while True:
+        try:
+            now = datetime.now(IST)
+            # 12 midnight window (00:00:00 to 00:05:00 IST)
+            if now.hour == 0 and now.minute < 5:
+                # The calendar day to report is the day that just concluded
+                target_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                if BOT_STATE.get("last_daily_report_date") != target_date:
+                    log.info(f"📅 [MIDNIGHT 12:00 AM IST] Dispatching Daily Summary for {target_date}...")
+                    summary_text = format_daily_summary(target_date)
+                    send_telegram_alert(summary_text)
+                    with STATE_LOCK:
+                        BOT_STATE["last_daily_report_date"] = target_date
+                    save_persisted_state()
+                    log.info(f"✅ Daily Summary for {target_date} sent to Telegram.")
+        except Exception as e:
+            log.warning(f"Error in daily report scheduler: {e}")
+        time.sleep(10)
+
+# ============================================================
 # FLASK KEEP-ALIVE SERVER (FOR RENDER.COM)
 # ============================================================
 app = Flask(__name__)
@@ -705,6 +856,23 @@ def health():
             "recent_decisions": btc_p["recent_decisions"][-10:]
         }
     return jsonify(data), 200
+
+@app.route("/daily-summary", methods=["GET"])
+def daily_summary():
+    date_param = request.args.get("date")
+    if not date_param:
+        date_param = datetime.now(IST).strftime("%Y-%m-%d")
+    summary = format_daily_summary(date_param)
+    return summary, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+@app.route("/send-daily-summary", methods=["GET", "POST"])
+def trigger_send_daily_summary():
+    date_param = request.args.get("date")
+    if not date_param:
+        date_param = datetime.now(IST).strftime("%Y-%m-%d")
+    summary = format_daily_summary(date_param)
+    notify_telegram_async(summary)
+    return jsonify({"status": "sent", "date": date_param, "preview": summary}), 200
 
 def run_flask_app():
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
@@ -858,6 +1026,24 @@ def run_trading_bot():
                             d["fee_inr"] = fee_inr
                             d["pnl_inr"] = net_pnl_inr
 
+                            close_time_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+                            c_date = d["candle_time"][:10] if len(d.get("candle_time", "")) >= 10 else datetime.now(IST).strftime("%Y-%m-%d")
+                            trade_record = {
+                                "symbol": sym,
+                                "tf": tf,
+                                "direction": d["direction"],
+                                "entry": d["entry"],
+                                "price": d["price"],
+                                "qty": d["qty"],
+                                "gross_pnl_inr": gross_pnl_inr,
+                                "fee_inr": fee_inr,
+                                "pnl_inr": net_pnl_inr,
+                                "reason": d["reason"],
+                                "candle_time": d["candle_time"],
+                                "close_time": close_time_ist,
+                                "date": c_date
+                            }
+
                             with STATE_LOCK:
                                 sym_state["paper_balance_inr"] += net_pnl_inr
                                 sym_state["total_pnl_inr"] += net_pnl_inr
@@ -868,6 +1054,12 @@ def run_trading_bot():
                                 sym_state["recent_decisions"].append(d)
                                 if len(sym_state["recent_decisions"]) > 50:
                                     sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+
+                                if "closed_trades_history" not in BOT_STATE:
+                                    BOT_STATE["closed_trades_history"] = []
+                                BOT_STATE["closed_trades_history"].append(trade_record)
+                                if len(BOT_STATE["closed_trades_history"]) > 500:
+                                    BOT_STATE["closed_trades_history"] = BOT_STATE["closed_trades_history"][-500:]
                             save_persisted_state()
 
                             log.info(f"🛑 [{sym} | {tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
@@ -916,8 +1108,13 @@ def run_trading_bot():
 # MAIN ENTRYPOINT
 # ============================================================
 def main():
+    load_persisted_state()
+
     flask_thread = threading.Thread(target=run_flask_app, name="FlaskKeepAlive", daemon=True)
     flask_thread.start()
+
+    daily_sched_thread = threading.Thread(target=run_daily_report_scheduler, name="DailyScheduler", daemon=True)
+    daily_sched_thread.start()
 
     def handle_shutdown(signum, frame):
         log.info(f"Shutdown signal received ({signum}). Exiting...")
