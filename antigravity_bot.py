@@ -224,6 +224,10 @@ def load_persisted_state():
                                     p_curr[key] = float(p_saved[key]) if "total_" in key or "balance" in key or "fees" in key else int(p_saved[key])
                             if "recent_decisions" in p_saved and isinstance(p_saved["recent_decisions"], list):
                                 p_curr["recent_decisions"] = p_saved["recent_decisions"]
+                            if "active_positions" in p_saved and isinstance(p_saved["active_positions"], dict):
+                                for tf_k, pos_data in p_saved["active_positions"].items():
+                                    if tf_k in p_curr["active_positions"]:
+                                        p_curr["active_positions"][tf_k] = pos_data
                 else:
                     # Legacy single-pair format migration into BTCUSDT
                     p_btc = BOT_STATE["pairs"]["BTCUSDT"]
@@ -281,6 +285,7 @@ def save_persisted_state():
                     "total_fees_inr": round(p["total_fees_inr"], 2),
                     "total_signals": p["total_signals"],
                     "total_trades_closed": p["total_trades_closed"],
+                    "active_positions": p["active_positions"],
                     "recent_decisions": p["recent_decisions"][-50:]
                 }
                 for sym, p in BOT_STATE["pairs"].items()
@@ -482,6 +487,62 @@ class FVGStrategy:
             "bull_score": bull_score, "bear_score": bear_score, "n": n
         }
 
+    def check_position_bar(self, h_val: float, l_val: float, bar_idx: int, candle_time: str) -> List[dict]:
+        decisions: List[dict] = []
+        if self.position is None:
+            return decisions
+
+        pos = self.position
+        d = pos.direction
+        hit_stop = (l_val <= pos.stop) if d == 1 else (h_val >= pos.stop)
+        hit_target = (h_val >= pos.target) if d == 1 else (l_val <= pos.target)
+
+        if hit_stop:
+            decisions.append({
+                "action": "close", "reason": "SL/Trailing Stop", "direction": "LONG" if d == 1 else "SHORT",
+                "price": float(pos.stop), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(bar_idx),
+                "tf": self.tf_label, "candle_time": candle_time
+            })
+            self.position = None
+            return decisions
+        elif hit_target:
+            decisions.append({
+                "action": "close", "reason": "TP", "direction": "LONG" if d == 1 else "SHORT",
+                "price": float(pos.target), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(bar_idx),
+                "tf": self.tf_label, "candle_time": candle_time
+            })
+            self.position = None
+            return decisions
+
+        # Trailing checks
+        favorable = float(h_val - pos.entry) if d == 1 else float(pos.entry - l_val)
+        dist_to_tp = abs(pos.target - pos.entry)
+
+        # Cost-to-Cost at 50% TP
+        if not pos.sl_moved_to_be and favorable >= (dist_to_tp * 0.5):
+            pos.stop = float(pos.entry)
+            pos.sl_moved_to_be = True
+            decisions.append({
+                "action": "trail", "reason": "50% TP Hit (Cost-to-Cost)",
+                "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
+            })
+
+        # +1R Milestone Trailing
+        current_r = favorable / pos.initial_risk if pos.initial_risk > 0 else 0
+        r_milestone = int(current_r)
+        if r_milestone >= 2 and r_milestone > pos.locked_r + 1:
+            pos.locked_r = r_milestone - 1
+            new_stop = float(pos.entry + (pos.locked_r * pos.initial_risk * d))
+            is_tighter = (new_stop > pos.stop) if d == 1 else (new_stop < pos.stop)
+            if is_tighter:
+                pos.stop = new_stop
+                decisions.append({
+                    "action": "trail", "reason": f"+{r_milestone}R Reached (Locked +{int(pos.locked_r)}R)",
+                    "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
+                })
+
+        return decisions
+
     def step(self, df: pd.DataFrame, risk_inr: float = 200.0, qty_prec: int = 6) -> List[dict]:
         if self.history is None:
             self.history = df.copy().reset_index(drop=True)
@@ -570,54 +631,11 @@ class FVGStrategy:
 
             # 3. Trailing SL & Position Monitoring
             if self.position is not None and i > self.position.entry_bar:
-                pos = self.position
-                d = pos.direction
-                hit_stop = (l[i] <= pos.stop) if d == 1 else (h[i] >= pos.stop)
-                hit_target = (h[i] >= pos.target) if d == 1 else (l[i] <= pos.target)
-
-                if hit_stop:
-                    decisions.append({
-                        "action": "close", "reason": "SL/Trailing Stop", "direction": "LONG" if d == 1 else "SHORT",
-                        "price": float(pos.stop), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(i),
-                        "tf": self.tf_label, "candle_time": candle_time
-                    })
-                    self.position = None
-                    continue
-                elif hit_target:
-                    decisions.append({
-                        "action": "close", "reason": "TP", "direction": "LONG" if d == 1 else "SHORT",
-                        "price": float(pos.target), "entry": float(pos.entry), "qty": float(pos.qty), "bar": int(i),
-                        "tf": self.tf_label, "candle_time": candle_time
-                    })
-                    self.position = None
-                    continue
-
-                # Trailing checks
-                favorable = float(h[i] - pos.entry) if d == 1 else float(pos.entry - l[i])
-                dist_to_tp = abs(pos.target - pos.entry)
-
-                # Cost-to-Cost at 50% TP
-                if not pos.sl_moved_to_be and favorable >= (dist_to_tp * 0.5):
-                    pos.stop = float(pos.entry)
-                    pos.sl_moved_to_be = True
-                    decisions.append({
-                        "action": "trail", "reason": "50% TP Hit (Cost-to-Cost)",
-                        "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
-                    })
-
-                # +1R Milestone Trailing
-                current_r = favorable / pos.initial_risk if pos.initial_risk > 0 else 0
-                r_milestone = int(current_r)
-                if r_milestone >= 2 and r_milestone > pos.locked_r + 1:
-                    pos.locked_r = r_milestone - 1
-                    new_stop = float(pos.entry + (pos.locked_r * pos.initial_risk * d))
-                    is_tighter = (new_stop > pos.stop) if d == 1 else (new_stop < pos.stop)
-                    if is_tighter:
-                        pos.stop = new_stop
-                        decisions.append({
-                            "action": "trail", "reason": f"+{r_milestone}R Reached (Locked +{int(pos.locked_r)}R)",
-                            "new_stop": float(pos.stop), "tf": self.tf_label, "candle_time": candle_time
-                        })
+                pos_decs = self.check_position_bar(h[i], l[i], i, candle_time)
+                if pos_decs:
+                    decisions.extend(pos_decs)
+                    if any(d["action"] == "close" for d in pos_decs):
+                        continue
 
             # 4. Entry Signals
             if self.position is None:
@@ -880,6 +898,166 @@ def trigger_send_daily_summary():
 def run_flask_app():
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
+def execute_decision(d: dict, sym: str, tf: str, sym_state: dict, risk_inr: float, fee_pct: float):
+    action = d["action"]
+
+    if action == "open":
+        qty = d["qty"]
+        log.info(f"🚨 [{sym} | {tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
+        log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
+        log.info(f"    Size: {qty} ({sym}) | Risk Capped: ₹{risk_inr:.2f} INR")
+
+        with STATE_LOCK:
+            sym_state["total_signals"] += 1
+            sym_state["active_positions"][tf] = {
+                "direction": d["direction"],
+                "direction_int": 1 if d["direction"] == "LONG" else -1,
+                "entry": float(d["entry"]),
+                "stop": float(d["stop"]),
+                "target": float(d["target"]),
+                "entry_usd": f"${d['entry']:,.2f}",
+                "stop_usd": f"${d['stop']:,.2f}",
+                "target_usd": f"${d['target']:,.2f}",
+                "rr": float(d["rr"]),
+                "risk": float(d["risk"]),
+                "initial_risk": float(d["risk"]),
+                "qty": float(qty),
+                "entry_bar": int(d.get("bar", 0)),
+                "time": d["candle_time"],
+                "sl_moved_to_be": False,
+                "locked_r": 0.0
+            }
+            sym_state["recent_decisions"].append(d)
+            if len(sym_state["recent_decisions"]) > 50:
+                sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+        save_persisted_state()
+
+        dir_emoji = "🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT"
+        trade_no = int(sym_state["total_signals"])
+        open_msg = (
+            f"🚨 <b>TRADE OPENED: {sym} (Trade #{trade_no})</b>\n\n"
+            f"⏱️ <b>Timeframe:</b> {tf}\n"
+            f"📈 <b>Direction:</b> {dir_emoji}\n"
+            f"💵 <b>Entry Price:</b> ${d['entry']:,.2f}\n"
+            f"🛑 <b>Stop Loss:</b> ${d['stop']:,.2f}\n"
+            f"🎯 <b>Target:</b> ${d['target']:,.2f}\n"
+            f"⚖️ <b>Target R:R:</b> {d['rr']:.2f} R\n"
+            f"🛡️ <b>Risk Capped:</b> ₹{risk_inr:,.2f} INR\n"
+            f"⏰ <b>Candle Time:</b> {d['candle_time']} IST"
+        )
+        notify_telegram_async(open_msg)
+
+    elif action == "trail":
+        log.info(f"🛡️ [{sym} | {tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
+        with STATE_LOCK:
+            if tf in sym_state["active_positions"] and sym_state["active_positions"][tf]:
+                sym_state["active_positions"][tf]["stop"] = float(d["new_stop"])
+                sym_state["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
+                if "50%" in d.get("reason", ""):
+                    sym_state["active_positions"][tf]["sl_moved_to_be"] = True
+            sym_state["recent_decisions"].append(d)
+            if len(sym_state["recent_decisions"]) > 50:
+                sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+        save_persisted_state()
+
+        trail_msg = (
+            f"🛡️ <b>SL TRAILED: {sym} ({tf})</b>\n\n"
+            f"📌 <b>Reason:</b> {d['reason']}\n"
+            f"🎯 <b>New Stop Loss:</b> ${d['new_stop']:,.2f}\n"
+            f"⏰ <b>Time:</b> {d['candle_time']} IST"
+        )
+        notify_telegram_async(trail_msg)
+
+    elif action == "close":
+        pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
+        gross_pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
+
+        entry_notional_usd = d["qty"] * d["entry"]
+        exit_notional_usd = d["qty"] * d["price"]
+        fee_usd = (entry_notional_usd + exit_notional_usd) * fee_pct
+        fee_usd_with_gst = fee_usd * (1 + GST_ON_FEE_PCT)
+        fee_inr = round(fee_usd_with_gst * USDT_INR_RATE, 2)
+
+        net_pnl_inr = round(gross_pnl_inr - fee_inr, 2)
+
+        d["symbol"] = sym
+        d["gross_pnl_inr"] = gross_pnl_inr
+        d["fee_inr"] = fee_inr
+        d["pnl_inr"] = net_pnl_inr
+
+        close_time_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        c_date = d["candle_time"][:10] if len(d.get("candle_time", "")) >= 10 else datetime.now(IST).strftime("%Y-%m-%d")
+        trade_record = {
+            "symbol": sym,
+            "tf": tf,
+            "direction": d["direction"],
+            "entry": d["entry"],
+            "price": d["price"],
+            "qty": d["qty"],
+            "gross_pnl_inr": gross_pnl_inr,
+            "fee_inr": fee_inr,
+            "pnl_inr": net_pnl_inr,
+            "reason": d["reason"],
+            "candle_time": d["candle_time"],
+            "close_time": close_time_ist,
+            "date": c_date
+        }
+
+        with STATE_LOCK:
+            sym_state["paper_balance_inr"] += net_pnl_inr
+            sym_state["total_pnl_inr"] += net_pnl_inr
+            sym_state["total_gross_pnl_inr"] += gross_pnl_inr
+            sym_state["total_fees_inr"] += fee_inr
+            sym_state["total_trades_closed"] += 1
+            sym_state["active_positions"][tf] = None
+            sym_state["recent_decisions"].append(d)
+            if len(sym_state["recent_decisions"]) > 50:
+                sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
+
+            if "closed_trades_history" not in BOT_STATE:
+                BOT_STATE["closed_trades_history"] = []
+            BOT_STATE["closed_trades_history"].append(trade_record)
+            if len(BOT_STATE["closed_trades_history"]) > 500:
+                BOT_STATE["closed_trades_history"] = BOT_STATE["closed_trades_history"][-500:]
+        save_persisted_state()
+
+        log.info(f"🛑 [{sym} | {tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
+        log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee: ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
+        log.info(f"    Updated {sym} Balance: ₹{sym_state['paper_balance_inr']:,.2f} INR")
+
+        trade_no = int(sym_state["total_trades_closed"])
+        if d["reason"] == "TP":
+            outcome_emoji = "🎯 TAKE PROFIT HIT"
+        elif abs(gross_pnl_inr) < 1.0:
+            outcome_emoji = "⚪ BREAKEVEN HIT"
+        elif gross_pnl_inr > 0:
+            outcome_emoji = "🟢 TRAILING PROFIT HIT"
+        else:
+            outcome_emoji = "❌ STOP LOSS HIT"
+
+        rr_achieved = round(gross_pnl_inr / risk_inr, 2) if risk_inr > 0 else 0.0
+        sign = "+" if net_pnl_inr > 0 else ""
+
+        with STATE_LOCK:
+            btc_b = BOT_STATE["pairs"]["BTCUSDT"]["paper_balance_inr"]
+            gold_b = BOT_STATE["pairs"]["XAUUSD"]["paper_balance_inr"]
+            comb_b = round(btc_b + gold_b, 2)
+
+        close_msg = (
+            f"🏁 <b>TRADE CLOSED: {sym} (Trade #{trade_no})</b>\n\n"
+            f"📊 <b>Outcome:</b> {outcome_emoji}\n"
+            f"⏱️ <b>Timeframe:</b> {tf} ({d['direction']})\n"
+            f"💵 <b>Entry:</b> ${d['entry']:,.2f} ➡️ <b>Exit:</b> ${d['price']:,.2f}\n"
+            f"⚖️ <b>R:R Achieved:</b> {sign}{rr_achieved:.2f} R\n"
+            f"💰 <b>Gross PnL:</b> ₹{gross_pnl_inr:+,.2f} INR\n"
+            f"🧾 <b>Exchange Fees:</b> ₹{fee_inr:,.2f} INR\n"
+            f"💵 <b>Net PnL (In Hand):</b> <b>₹{net_pnl_inr:+,.2f} INR</b>\n\n"
+            f"💼 <b>Updated {sym} Balance:</b> ₹{sym_state['paper_balance_inr']:,.2f} INR\n"
+            f"💰 <b>Total Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
+            f"⏰ <b>Close Time:</b> {d['candle_time']} IST"
+        )
+        notify_telegram_async(close_msg)
+
 # ============================================================
 # MAIN PARALLEL MULTI-ASSET ENGINE
 # ============================================================
@@ -895,6 +1073,32 @@ def run_trading_bot():
         sym: {tf: FVGStrategy(tf) for tf in cfg["timeframes"]}
         for sym, cfg in PAIRS_CONFIG.items()
     }
+
+    # Restore in-flight active positions from persisted state into strategy engines
+    with STATE_LOCK:
+        for sym, p_state in BOT_STATE["pairs"].items():
+            for tf, pos_dict in p_state.get("active_positions", {}).items():
+                if pos_dict and tf in engines[sym]:
+                    try:
+                        d_int = int(pos_dict.get("direction_int", 1 if pos_dict.get("direction") == "LONG" else -1))
+                        ent = float(pos_dict.get("entry", float(str(pos_dict.get("entry_usd", "0")).replace("$", "").replace(",", ""))))
+                        stp = float(pos_dict.get("stop", float(str(pos_dict.get("stop_usd", "0")).replace("$", "").replace(",", ""))))
+                        tgt = float(pos_dict.get("target", float(str(pos_dict.get("target_usd", "0")).replace("$", "").replace(",", ""))))
+                        q = float(pos_dict.get("qty", 0.0))
+                        rr_val = float(pos_dict.get("rr", 2.0))
+                        init_risk = float(pos_dict.get("initial_risk", pos_dict.get("risk", abs(ent - stp))))
+                        e_bar = int(pos_dict.get("entry_bar", 0))
+                        sl_be = bool(pos_dict.get("sl_moved_to_be", False))
+                        loc_r = float(pos_dict.get("locked_r", 0.0))
+
+                        engines[sym][tf].position = Position(
+                            direction=d_int, entry=ent, stop=stp, target=tgt,
+                            entry_bar=e_bar, rr=rr_val, initial_risk=init_risk,
+                            qty=q, sl_moved_to_be=sl_be, locked_r=loc_r
+                        )
+                        log.info(f"🔄 Restored active in-flight position for [{sym} | {tf}]: {pos_dict.get('direction')} @ ${ent:,.2f}")
+                    except Exception as ex:
+                        log.warning(f"Could not restore active position for {sym} {tf}: {ex}")
 
     last_candle_times = {
         sym: {tf: None for tf in cfg["timeframes"]}
@@ -931,6 +1135,18 @@ def run_trading_bot():
                     if df is None or len(df) < 30:
                         continue
 
+                    strat = engines[sym][tf]
+
+                    # 1. REAL-TIME LIVE CANDLE SL / TP MONITORING (Checked every 20s tick)
+                    if strat.position is not None:
+                        live_bar = df.iloc[-1]
+                        live_h = float(live_bar["High"])
+                        live_l = float(live_bar["Low"])
+                        live_time = str(live_bar["Time"])
+                        live_decs = strat.check_position_bar(live_h, live_l, len(df) - 1, live_time)
+                        for d in live_decs:
+                            execute_decision(d, sym, tf, sym_state, risk_inr, fee_pct)
+
                     latest_closed_time = str(df["Time"].iloc[-2])
                     if latest_closed_time == last_candle_times[sym][tf]:
                         continue
@@ -939,7 +1155,6 @@ def run_trading_bot():
                     last_candle_times[sym][tf] = latest_closed_time
 
                     df_closed = df.iloc[:-1].reset_index(drop=True)
-                    strat = engines[sym][tf]
                     decisions = strat.step(df_closed, risk_inr=risk_inr, qty_prec=qty_prec)
 
                     with STATE_LOCK:
@@ -947,160 +1162,17 @@ def run_trading_bot():
                         sym_state["active_zones"][tf] = len(strat.zones)
 
                     if is_warmup:
-                        strat.position = None
+                        active_pos = sym_state["active_positions"].get(tf)
+                        if not active_pos:
+                            strat.position = None
                         log.info(
                             f"[{sym} | {tf}] Warmed up {len(df_closed)} bars (latest: {latest_closed_time} IST). "
-                            f"Active zones: {len(strat.zones)}. Monitoring live..."
+                            f"Active zones: {len(strat.zones)}. Position: {'ACTIVE' if strat.position else 'None'}. Monitoring live..."
                         )
                         continue
 
                     for d in decisions:
-                        action = d["action"]
-
-                        if action == "open":
-                            qty = d["qty"]
-                            log.info(f"🚨 [{sym} | {tf} | {d['candle_time']}] SIGNAL: {d['direction']} @ ${d['entry']:,.2f}")
-                            log.info(f"    Stop: ${d['stop']:,.2f} | Target: ${d['target']:,.2f} | R:R: {d['rr']:.2f}")
-                            log.info(f"    Size: {qty} ({sym}) | Risk Capped: ₹{risk_inr:.2f} INR")
-
-                            with STATE_LOCK:
-                                sym_state["total_signals"] += 1
-                                sym_state["active_positions"][tf] = {
-                                    "direction": d["direction"],
-                                    "entry_usd": f"${d['entry']:,.2f}",
-                                    "stop_usd": f"${d['stop']:,.2f}",
-                                    "target_usd": f"${d['target']:,.2f}",
-                                    "rr": d["rr"],
-                                    "qty": qty,
-                                    "time": d["candle_time"]
-                                }
-                                sym_state["recent_decisions"].append(d)
-                                if len(sym_state["recent_decisions"]) > 50:
-                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
-                            save_persisted_state()
-
-                            dir_emoji = "🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT"
-                            trade_no = int(sym_state["total_signals"])
-                            open_msg = (
-                                f"🚨 <b>TRADE OPENED: {sym} (Trade #{trade_no})</b>\n\n"
-                                f"⏱️ <b>Timeframe:</b> {tf}\n"
-                                f"📈 <b>Direction:</b> {dir_emoji}\n"
-                                f"💵 <b>Entry Price:</b> ${d['entry']:,.2f}\n"
-                                f"🛑 <b>Stop Loss:</b> ${d['stop']:,.2f}\n"
-                                f"🎯 <b>Target:</b> ${d['target']:,.2f}\n"
-                                f"⚖️ <b>Target R:R:</b> {d['rr']:.2f} R\n"
-                                f"🛡️ <b>Risk Capped:</b> ₹{risk_inr:,.2f} INR\n"
-                                f"⏰ <b>Candle Time:</b> {d['candle_time']} IST"
-                            )
-                            notify_telegram_async(open_msg)
-
-                        elif action == "trail":
-                            log.info(f"🛡️ [{sym} | {tf} | {d['candle_time']}] SL TRAILED: {d['reason']} | New SL: ${d['new_stop']:,.2f}")
-                            with STATE_LOCK:
-                                if tf in sym_state["active_positions"] and sym_state["active_positions"][tf]:
-                                    sym_state["active_positions"][tf]["stop_usd"] = f"${d['new_stop']:,.2f}"
-                                sym_state["recent_decisions"].append(d)
-                                if len(sym_state["recent_decisions"]) > 50:
-                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
-                            save_persisted_state()
-
-                            trail_msg = (
-                                f"🛡️ <b>SL TRAILED: {sym} ({tf})</b>\n\n"
-                                f"📌 <b>Reason:</b> {d['reason']}\n"
-                                f"🎯 <b>New Stop Loss:</b> ${d['new_stop']:,.2f}\n"
-                                f"⏰ <b>Time:</b> {d['candle_time']} IST"
-                            )
-                            notify_telegram_async(trail_msg)
-
-                        elif action == "close":
-                            pnl_usd = d["qty"] * (d["price"] - d["entry"]) * (1 if d["direction"] == "LONG" else -1)
-                            gross_pnl_inr = round(pnl_usd * USDT_INR_RATE, 2)
-
-                            entry_notional_usd = d["qty"] * d["entry"]
-                            exit_notional_usd = d["qty"] * d["price"]
-                            fee_usd = (entry_notional_usd + exit_notional_usd) * fee_pct
-                            fee_usd_with_gst = fee_usd * (1 + GST_ON_FEE_PCT)
-                            fee_inr = round(fee_usd_with_gst * USDT_INR_RATE, 2)
-
-                            net_pnl_inr = round(gross_pnl_inr - fee_inr, 2)
-
-                            d["symbol"] = sym
-                            d["gross_pnl_inr"] = gross_pnl_inr
-                            d["fee_inr"] = fee_inr
-                            d["pnl_inr"] = net_pnl_inr
-
-                            close_time_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-                            c_date = d["candle_time"][:10] if len(d.get("candle_time", "")) >= 10 else datetime.now(IST).strftime("%Y-%m-%d")
-                            trade_record = {
-                                "symbol": sym,
-                                "tf": tf,
-                                "direction": d["direction"],
-                                "entry": d["entry"],
-                                "price": d["price"],
-                                "qty": d["qty"],
-                                "gross_pnl_inr": gross_pnl_inr,
-                                "fee_inr": fee_inr,
-                                "pnl_inr": net_pnl_inr,
-                                "reason": d["reason"],
-                                "candle_time": d["candle_time"],
-                                "close_time": close_time_ist,
-                                "date": c_date
-                            }
-
-                            with STATE_LOCK:
-                                sym_state["paper_balance_inr"] += net_pnl_inr
-                                sym_state["total_pnl_inr"] += net_pnl_inr
-                                sym_state["total_gross_pnl_inr"] += gross_pnl_inr
-                                sym_state["total_fees_inr"] += fee_inr
-                                sym_state["total_trades_closed"] += 1
-                                sym_state["active_positions"][tf] = None
-                                sym_state["recent_decisions"].append(d)
-                                if len(sym_state["recent_decisions"]) > 50:
-                                    sym_state["recent_decisions"] = sym_state["recent_decisions"][-50:]
-
-                                if "closed_trades_history" not in BOT_STATE:
-                                    BOT_STATE["closed_trades_history"] = []
-                                BOT_STATE["closed_trades_history"].append(trade_record)
-                                if len(BOT_STATE["closed_trades_history"]) > 500:
-                                    BOT_STATE["closed_trades_history"] = BOT_STATE["closed_trades_history"][-500:]
-                            save_persisted_state()
-
-                            log.info(f"🛑 [{sym} | {tf} | {d['candle_time']}] EXIT: {d['reason']} on {d['direction']} at ${d['price']:,.2f}")
-                            log.info(f"    Gross PnL: ₹{gross_pnl_inr:+.2f} | Fee: ₹{fee_inr:.2f} | Net PnL: ₹{net_pnl_inr:+.2f} INR")
-                            log.info(f"    Updated {sym} Balance: ₹{sym_state['paper_balance_inr']:,.2f} INR")
-
-                            trade_no = int(sym_state["total_trades_closed"])
-                            if d["reason"] == "TP":
-                                outcome_emoji = "🎯 TAKE PROFIT HIT"
-                            elif abs(gross_pnl_inr) < 1.0:
-                                outcome_emoji = "⚪ BREAKEVEN HIT"
-                            elif gross_pnl_inr > 0:
-                                outcome_emoji = "🟢 TRAILING PROFIT HIT"
-                            else:
-                                outcome_emoji = "❌ STOP LOSS HIT"
-
-                            rr_achieved = round(gross_pnl_inr / risk_inr, 2) if risk_inr > 0 else 0.0
-                            sign = "+" if net_pnl_inr > 0 else ""
-
-                            with STATE_LOCK:
-                                btc_b = BOT_STATE["pairs"]["BTCUSDT"]["paper_balance_inr"]
-                                gold_b = BOT_STATE["pairs"]["XAUUSD"]["paper_balance_inr"]
-                                comb_b = round(btc_b + gold_b, 2)
-
-                            close_msg = (
-                                f"🏁 <b>TRADE CLOSED: {sym} (Trade #{trade_no})</b>\n\n"
-                                f"📊 <b>Outcome:</b> {outcome_emoji}\n"
-                                f"⏱️ <b>Timeframe:</b> {tf} ({d['direction']})\n"
-                                f"💵 <b>Entry:</b> ${d['entry']:,.2f} ➡️ <b>Exit:</b> ${d['price']:,.2f}\n"
-                                f"⚖️ <b>R:R Achieved:</b> {sign}{rr_achieved:.2f} R\n"
-                                f"💰 <b>Gross PnL:</b> ₹{gross_pnl_inr:+,.2f} INR\n"
-                                f"🧾 <b>Exchange Fees:</b> ₹{fee_inr:,.2f} INR\n"
-                                f"💵 <b>Net PnL (In Hand):</b> <b>₹{net_pnl_inr:+,.2f} INR</b>\n\n"
-                                f"💼 <b>Updated {sym} Balance:</b> ₹{sym_state['paper_balance_inr']:,.2f} INR\n"
-                                f"💰 <b>Total Portfolio Balance:</b> ₹{comb_b:,.2f} INR\n"
-                                f"⏰ <b>Close Time:</b> {d['candle_time']} IST"
-                            )
-                            notify_telegram_async(close_msg)
+                        execute_decision(d, sym, tf, sym_state, risk_inr, fee_pct)
 
         except Exception as loop_err:
             log.exception(f"Unexpected error in trading loop: {loop_err}")
