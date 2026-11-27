@@ -789,25 +789,27 @@ def run_daily_report_scheduler():
     """
     Dedicated background scheduler running in its own thread.
     Checks IST clock every 10 seconds.
-    At 12:00 AM midnight IST (00:00:00 to 00:05:00 window), it automatically
-    compiles and sends the full daily trading summary for the completed day to Telegram.
+    Anytime after 12:00 AM midnight IST (00:00:00 onwards), if yesterday's daily summary
+    has not been dispatched yet, it automatically compiles and sends it to Telegram.
+    This guarantees that even if the device was asleep or disconnected during 00:00,
+    it catches up and sends the summary as soon as it reconnects.
     """
-    log.info("⏰ [DAILY SCHEDULER] Daily Midnight (12:00 AM IST) Telegram overview daemon started.")
+    log.info("⏰ [DAILY SCHEDULER] Daily Midnight Telegram overview daemon started.")
     while True:
         try:
             now = datetime.now(IST)
-            # 12 midnight window (00:00:00 to 00:05:00 IST)
-            if now.hour == 0 and now.minute < 5:
-                # The calendar day to report is the day that just concluded
-                target_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-                if BOT_STATE.get("last_daily_report_date") != target_date:
-                    log.info(f"📅 [MIDNIGHT 12:00 AM IST] Dispatching Daily Summary for {target_date}...")
-                    summary_text = format_daily_summary(target_date)
-                    send_telegram_alert(summary_text)
-                    with STATE_LOCK:
-                        BOT_STATE["last_daily_report_date"] = target_date
-                    save_persisted_state()
-                    log.info(f"✅ Daily Summary for {target_date} sent to Telegram.")
+            # The calendar day to report is yesterday
+            target_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+            # Check if yesterday's summary has already been sent
+            if BOT_STATE.get("last_daily_report_date") != target_date:
+                log.info(f"📅 [MIDNIGHT SCHEDULER] Dispatching Daily Summary for {target_date}...")
+                summary_text = format_daily_summary(target_date)
+                send_telegram_alert(summary_text)
+                with STATE_LOCK:
+                    BOT_STATE["last_daily_report_date"] = target_date
+                save_persisted_state()
+                log.info(f"✅ Daily Summary for {target_date} sent to Telegram.")
         except Exception as e:
             log.warning(f"Error in daily report scheduler: {e}")
         time.sleep(10)
