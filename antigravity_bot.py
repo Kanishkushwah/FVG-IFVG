@@ -142,6 +142,32 @@ USE_TREND_FILTER = True
 TREND_EMA_LEN = 200
 
 # ==============================================================================
+# WEEKEND LOW-VOLUME FILTER
+# ==============================================================================
+def is_weekend_filter_active(dt: Optional[datetime] = None) -> bool:
+    """
+    Weekend Low-Volume Filter:
+    Blocks NEW trade entries during weekends to avoid low-liquidity chop and false breakouts.
+    
+    Active window:
+      - All of Saturday (00:00:00 IST to 23:59:59 IST)
+      - All of Sunday (00:00:00 IST to 23:59:59 IST)
+      - Monday until 04:30 AM IST (1 hour before Asian Session 05:30 AM IST / Tokyo Open)
+    
+    Crucial Rule:
+      - In-flight/running trades entered prior to weekend continue 24/7 until TP/SL/Trailing SL!
+    """
+    if dt is None:
+        dt = datetime.now(IST)
+    weekday = dt.weekday()
+    if weekday in (5, 6):  # Saturday or Sunday
+        return True
+    if weekday == 0:  # Monday
+        if (dt.hour < 4) or (dt.hour == 4 and dt.minute < 30):
+            return True
+    return False
+
+# ==============================================================================
 # DATA MODELS
 # ==============================================================================
 @dataclass
@@ -637,56 +663,60 @@ class FVGStrategy:
                     if any(d["action"] == "close" for d in pos_decs):
                         continue
 
-            # 4. Entry Signals
+            # 4. Entry Signals (Filtered during Weekend Low-Volume Window)
             if self.position is None:
-                recent_high = np.max(h[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
-                recent_low = np.min(l[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
-                trend_ok_long = (not USE_TREND_FILTER) or (c[i] > ema_trend[i])
-                trend_ok_short = (not USE_TREND_FILTER) or (c[i] < ema_trend[i])
-                risk_usd = risk_inr / USDT_INR_RATE
+                if is_weekend_filter_active():
+                    # Skip generating new trade entries during weekend low-volume window
+                    pass
+                else:
+                    recent_high = np.max(h[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
+                    recent_low = np.min(l[max(0, i - TARGET_LOOKBACK):i]) if i > 0 else np.nan
+                    trend_ok_long = (not USE_TREND_FILTER) or (c[i] > ema_trend[i])
+                    trend_ok_short = (not USE_TREND_FILTER) or (c[i] < ema_trend[i])
+                    risk_usd = risk_inr / USDT_INR_RATE
 
-                if selected_long is not None and trend_ok_long:
-                    bottom, top, score, rb = selected_long
-                    entry = float(bottom)
-                    zh = float(top - bottom)
-                    sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
-                    stop = float(entry - sl_dist)
-                    risk = float(entry - stop)
+                    if selected_long is not None and trend_ok_long:
+                        bottom, top, score, rb = selected_long
+                        entry = float(bottom)
+                        zh = float(top - bottom)
+                        sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
+                        stop = float(entry - sl_dist)
+                        risk = float(entry - stop)
 
-                    if risk > 1e-4:
-                        min_target = entry + risk * MIN_RR
-                        target = float(recent_high) if (not np.isnan(recent_high) and recent_high > min_target) else float(min_target)
-                        actual_rr = float((target - entry) / risk)
-                        # -1e-9 tolerance prevents IEEE-754 precision rejects
-                        if actual_rr >= MIN_RR - 1e-9:
-                            qty = round(risk_usd / risk, qty_prec)
-                            self.position = Position(1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
-                            decisions.append({
-                                "action": "open", "direction": "LONG", "entry": entry, "stop": stop,
-                                "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
-                                "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
-                            })
+                        if risk > 1e-4:
+                            min_target = entry + risk * MIN_RR
+                            target = float(recent_high) if (not np.isnan(recent_high) and recent_high > min_target) else float(min_target)
+                            actual_rr = float((target - entry) / risk)
+                            # -1e-9 tolerance prevents IEEE-754 precision rejects
+                            if actual_rr >= MIN_RR - 1e-9:
+                                qty = round(risk_usd / risk, qty_prec)
+                                self.position = Position(1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
+                                decisions.append({
+                                    "action": "open", "direction": "LONG", "entry": entry, "stop": stop,
+                                    "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
+                                    "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
+                                })
 
-                elif selected_short is not None and trend_ok_short:
-                    top, bottom, score, rb = selected_short
-                    entry = float(top)
-                    zh = float(top - bottom)
-                    sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
-                    stop = float(entry + sl_dist)
-                    risk = float(stop - entry)
+                    elif selected_short is not None and trend_ok_short:
+                        top, bottom, score, rb = selected_short
+                        entry = float(top)
+                        zh = float(top - bottom)
+                        sl_dist = float(max(zh * SL_ZONE_MULT, atr[i] * SL_BUFFER))
+                        stop = float(entry + sl_dist)
+                        risk = float(stop - entry)
 
-                    if risk > 1e-4:
-                        min_target = entry - risk * MIN_RR
-                        target = float(recent_low) if (not np.isnan(recent_low) and recent_low < min_target) else float(min_target)
-                        actual_rr = float((entry - target) / risk)
-                        if actual_rr >= MIN_RR - 1e-9:
-                            qty = round(risk_usd / risk, qty_prec)
-                            self.position = Position(-1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
-                            decisions.append({
-                                "action": "open", "direction": "SHORT", "entry": entry, "stop": stop,
-                                "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
-                                "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
-                            })
+                        if risk > 1e-4:
+                            min_target = entry - risk * MIN_RR
+                            target = float(recent_low) if (not np.isnan(recent_low) and recent_low < min_target) else float(min_target)
+                            actual_rr = float((entry - target) / risk)
+                            if actual_rr >= MIN_RR - 1e-9:
+                                qty = round(risk_usd / risk, qty_prec)
+                                self.position = Position(-1, entry, stop, target, int(rb), actual_rr, risk, qty=qty)
+                                decisions.append({
+                                    "action": "open", "direction": "SHORT", "entry": entry, "stop": stop,
+                                    "target": target, "rr": actual_rr, "risk": risk, "qty": qty, "score": float(score),
+                                    "bar": int(i), "tf": self.tf_label, "candle_time": candle_time
+                                })
 
         self.processed_count = n
         return decisions
@@ -842,6 +872,8 @@ def health():
             "bot": "Antigravity Dual Multi-Asset Engine (BTC/USDT + GOLD OANDA)",
             "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
             "uptime_hours": round((time.time() - BOT_STATE["start_time"]) / 3600.0, 2),
+            "weekend_filter_active": is_weekend_filter_active(),
+            "trading_mode": "WEEKEND_MANAGE_ONLY (Running trades active, new entries paused until Mon 04:30 IST)" if is_weekend_filter_active() else "NORMAL_TRADING",
             "combined_balance_inr": combined_bal,
             "combined_net_pnl_inr": combined_pnl,
             "combined_gross_pnl_inr": combined_gross,
