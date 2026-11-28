@@ -1,6 +1,6 @@
 """
 ================================================================================
-ANTIGRAVITY BOT — DUAL PARALLEL MULTI-ASSET ENGINE (BTC/USDT + GOLD OANDA)
+ICT BOT — DUAL PARALLEL MULTI-ASSET ENGINE (BTC/USDT + GOLD OANDA)
 ================================================================================
 Cloud Deployment for Render.com:
   - Asset 1: BTCUSDT (Binance Public API — 100% TradingView Match)
@@ -243,7 +243,6 @@ BOT_STATE = {
     "start_time": time.time(),
     "last_poll_time": None,
     "last_daily_report_date": None,
-    "live_monitor_msg_id": 45,
     "closed_trades_history": [],
     "pairs": {
         sym: {
@@ -279,8 +278,6 @@ def load_persisted_state():
                     BOT_STATE["start_time"] = saved["start_time"]
                 if "last_daily_report_date" in saved:
                     BOT_STATE["last_daily_report_date"] = saved["last_daily_report_date"]
-                if "live_monitor_msg_id" in saved and saved["live_monitor_msg_id"]:
-                    BOT_STATE["live_monitor_msg_id"] = int(saved["live_monitor_msg_id"])
                 if "closed_trades_history" in saved and isinstance(saved["closed_trades_history"], list):
                     BOT_STATE["closed_trades_history"] = saved["closed_trades_history"]
 
@@ -347,7 +344,6 @@ def save_persisted_state():
         data = {
             "start_time": BOT_STATE["start_time"],
             "last_daily_report_date": BOT_STATE.get("last_daily_report_date"),
-            "live_monitor_msg_id": BOT_STATE.get("live_monitor_msg_id"),
             "closed_trades_history": BOT_STATE.get("closed_trades_history", [])[-500:],
             "pairs": {
                 sym: {
@@ -796,7 +792,7 @@ def format_daily_summary(target_date: str) -> str:
     total_trades = len(trades)
     if total_trades == 0:
         msg = (
-            f"📊 <b>DAILY TRADING SUMMARY | ANTIGRAVITY BOT</b>\n"
+            f"📊 <b>DAILY TRADING SUMMARY | ICT BOT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 <b>Date:</b> {date_display}\n"
             f"🎯 <b>Total Trades Taken Today:</b> 0\n"
@@ -840,7 +836,7 @@ def format_daily_summary(target_date: str) -> str:
     open_pos_str = f"\n⚠️ <b>Active Open Positions:</b> {', '.join(open_pos_list)}\n" if open_pos_list else ""
 
     msg = (
-        f"📊 <b>DAILY TRADING SUMMARY | ANTIGRAVITY BOT</b>\n"
+        f"📊 <b>DAILY TRADING SUMMARY | ICT BOT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>Date:</b> {date_display}\n"
         f"🎯 <b>Total Trades Taken Today:</b> {total_trades}\n"
@@ -892,161 +888,6 @@ def run_daily_report_scheduler():
         time.sleep(10)
 
 # ============================================================
-# ⚡ ICE TRADING — LIVE TELEGRAM ANIMATED MONITOR
-# ============================================================
-LATEST_LIVE_PRICES: Dict[str, Optional[float]] = {
-    "BTCUSDT": None,
-    "XAUUSD": None
-}
-
-ICE_ANIM_FRAMES = [
-    "▰▱▱▱▱",
-    "▰▰▱▱▱",
-    "▰▰▰▱▱",
-    "▰▰▰▰▱",
-    "▰▰▰▰▰",
-    "▰▰▰▰▱",
-    "▰▰▰▱▱",
-    "▰▰▱▱▱",
-]
-
-def get_live_market_price(symbol: str) -> Optional[float]:
-    """Fast live price fetch for animated monitor without stalling trading loop."""
-    if symbol == "BTCUSDT":
-        try:
-            r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=1.8)
-            if r.status_code == 200:
-                val = float(r.json()["price"])
-                LATEST_LIVE_PRICES["BTCUSDT"] = val
-                return val
-        except Exception:
-            pass
-    return LATEST_LIVE_PRICES.get(symbol)
-
-def run_ice_telegram_monitor():
-    """
-    Dedicated live animation daemon: rotates running progress indicator & updates
-    live PnL every 2.5s via a single Telegram message (editMessageText).
-    """
-    log.info("⚡ [ICE MONITOR] Live Telegram Animation daemon started.")
-    frame_idx = 0
-    last_card_mode = None  # "LIVE", "IDLE"
-    last_idle_refresh = 0.0
-
-    while True:
-        try:
-            # Check if any pair has an active open position
-            active_trade = None
-            with STATE_LOCK:
-                for sym, p_state in BOT_STATE.get("pairs", {}).items():
-                    for tf, pos_dict in p_state.get("active_positions", {}).items():
-                        if pos_dict:
-                            active_trade = (sym, tf, pos_dict)
-                            break
-                    if active_trade:
-                        break
-
-            msg_id = BOT_STATE.get("live_monitor_msg_id")
-
-            if active_trade:
-                sym, tf, pos = active_trade
-                direction = pos.get("direction", "SHORT")
-                entry = float(pos.get("entry", float(str(pos.get("entry_usd", "0")).replace("$", "").replace(",", ""))))
-                stop = float(pos.get("stop", float(str(pos.get("stop_usd", "0")).replace("$", "").replace(",", ""))))
-                target = float(pos.get("target", float(str(pos.get("target_usd", "0")).replace("$", "").replace(",", ""))))
-                qty = float(pos.get("qty", 0.0))
-                init_risk = float(pos.get("initial_risk", pos.get("risk", abs(entry - stop))))
-                sl_trailed = bool(pos.get("sl_moved_to_be", False)) or float(pos.get("locked_r", 0.0)) > 0
-
-                curr_price = get_live_market_price(sym)
-                if curr_price is None or curr_price <= 0:
-                    curr_price = entry
-
-                if direction == "LONG":
-                    price_move = curr_price - entry
-                    dir_emoji = "🟢"
-                else:
-                    price_move = entry - curr_price
-                    dir_emoji = "🔴"
-
-                pnl_pct = (price_move / entry) * 100 if entry > 0 else 0.0
-                pnl_inr = price_move * qty * USDT_INR_RATE
-                r_achieved = (price_move / init_risk) if init_risk > 0 else 0.0
-
-                pnl_sign = "+" if pnl_pct >= 0 else ""
-                inr_sign = "+" if pnl_inr >= 0 else ""
-                r_sign = "+" if r_achieved >= 0 else ""
-
-                sl_label = " (Trailed)" if sl_trailed else ""
-                frame = ICE_ANIM_FRAMES[frame_idx % len(ICE_ANIM_FRAMES)]
-                frame_idx += 1
-
-                card_text = (
-                    f"⚡ <b>ICE | LIVE POSITION</b>\n"
-                    f"{dir_emoji} <b>{sym} · {direction} ({tf})</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"<pre>"
-                    f"Entry     ${entry:,.2f}\n"
-                    f"Current   ${curr_price:,.2f}\n"
-                    f"SL        ${stop:,.2f}{sl_label}\n"
-                    f"TP        ${target:,.2f}"
-                    f"</pre>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💰 <b>PnL:</b> <b>{pnl_sign}{pnl_pct:.2f}% ({inr_sign}₹{pnl_inr:,.2f} INR | {r_sign}{r_achieved:.2f}R)</b>\n"
-                    f"🟢 <code>{frame}</code>  <b>RUNNING</b>"
-                )
-
-                if not msg_id:
-                    new_id = send_telegram_msg_ret_id(card_text)
-                    if new_id:
-                        with STATE_LOCK:
-                            BOT_STATE["live_monitor_msg_id"] = new_id
-                        save_persisted_state()
-                else:
-                    success = edit_telegram_msg_by_id(msg_id, card_text)
-                    if not success:
-                        new_id = send_telegram_msg_ret_id(card_text)
-                        if new_id:
-                            with STATE_LOCK:
-                                BOT_STATE["live_monitor_msg_id"] = new_id
-                            save_persisted_state()
-
-                last_card_mode = "LIVE"
-                time.sleep(2.5)
-
-            else:
-                idle_text = (
-                    "⚡ <b>ICE TRADING</b>\n"
-                    "🟢 <b>SYSTEM ACTIVE</b>\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    "📡 <b>Scanning Markets...</b>\n"
-                    "<code>BTC • ETH • SOL • NQ • GOLD</code>\n"
-                    "⏳ <b>Waiting for setup</b>"
-                )
-                now_ts = time.time()
-                if last_card_mode != "IDLE":
-                    if msg_id:
-                        edit_telegram_msg_by_id(msg_id, idle_text)
-                    else:
-                        new_id = send_telegram_msg_ret_id(idle_text)
-                        if new_id:
-                            with STATE_LOCK:
-                                BOT_STATE["live_monitor_msg_id"] = new_id
-                            save_persisted_state()
-                    last_card_mode = "IDLE"
-                    last_idle_refresh = now_ts
-                elif now_ts - last_idle_refresh > 60:
-                    if msg_id:
-                        edit_telegram_msg_by_id(msg_id, idle_text)
-                    last_idle_refresh = now_ts
-
-                time.sleep(5.0)
-
-        except Exception as e:
-            log.warning(f"Error in IceLiveMonitor: {e}")
-            time.sleep(3.0)
-
-# ============================================================
 # FLASK KEEP-ALIVE SERVER (FOR RENDER.COM)
 # ============================================================
 app = Flask(__name__)
@@ -1054,7 +895,7 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 @app.route("/", methods=["GET"])
 def keep_alive():
-    return "Antigravity Multi-Asset (BTC + GOLD) Bot Online", 200
+    return "ICT Multi-Asset (BTC + GOLD) Bot Online", 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -1071,7 +912,7 @@ def health():
 
         data = {
             "status": "online",
-            "bot": "Antigravity Dual Multi-Asset Engine (BTC/USDT + GOLD OANDA)",
+            "bot": "ICT Dual Multi-Asset Engine (BTC/USDT + GOLD OANDA)",
             "server_time_ist": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
             "uptime_hours": round((time.time() - BOT_STATE["start_time"]) / 3600.0, 2),
             "weekend_filter_active": is_weekend_filter_active(),
@@ -1171,7 +1012,7 @@ def execute_decision(d: dict, sym: str, tf: str, sym_state: dict, risk_inr: floa
         dir_emoji = "🟢 LONG" if d["direction"] == "LONG" else "🔴 SHORT"
         trade_no = int(sym_state["total_signals"])
         open_msg = (
-            f"🚨 <b>TRADE OPENED: {sym} (Trade #{trade_no})</b>\n\n"
+            f"🚨 <b>ICT TRADE OPENED: {sym} (Trade #{trade_no})</b>\n\n"
             f"⏱️ <b>Timeframe:</b> {tf}\n"
             f"📈 <b>Direction:</b> {dir_emoji}\n"
             f"💵 <b>Entry Price:</b> ${d['entry']:,.2f}\n"
@@ -1199,7 +1040,7 @@ def execute_decision(d: dict, sym: str, tf: str, sym_state: dict, risk_inr: floa
         save_persisted_state()
 
         trail_msg = (
-            f"🛡️ <b>SL TRAILED: {sym} ({tf})</b>\n\n"
+            f"🛡️ <b>ICT SL TRAILED: {sym} ({tf})</b>\n\n"
             f"📌 <b>Reason:</b> {d['reason']}\n"
             f"🎯 <b>New Stop Loss:</b> ${d['new_stop']:,.2f}\n"
             f"⏰ <b>Time:</b> {d['candle_time']} IST"
@@ -1282,7 +1123,7 @@ def execute_decision(d: dict, sym: str, tf: str, sym_state: dict, risk_inr: floa
             comb_b = round(btc_b + gold_b, 2)
 
         close_msg = (
-            f"🏁 <b>TRADE CLOSED: {sym} (Trade #{trade_no})</b>\n\n"
+            f"🏁 <b>ICT TRADE CLOSED: {sym} (Trade #{trade_no})</b>\n\n"
             f"📊 <b>Outcome:</b> {outcome_emoji}\n"
             f"⏱️ <b>Timeframe:</b> {tf} ({d['direction']})\n"
             f"💵 <b>Entry:</b> ${d['entry']:,.2f} ➡️ <b>Exit:</b> ${d['price']:,.2f}\n"
@@ -1295,20 +1136,6 @@ def execute_decision(d: dict, sym: str, tf: str, sym_state: dict, risk_inr: floa
             f"⏰ <b>Close Time:</b> {d['candle_time']} IST"
         )
         notify_telegram_async(close_msg)
-
-        # Update live ICE monitor message to POSITION CLOSED
-        msg_id = BOT_STATE.get("live_monitor_msg_id")
-        if msg_id:
-            pnl_pct = (abs(d["price"] - d["entry"]) / d["entry"] * 100) if d["entry"] > 0 else 0.0
-            dir_sign = "+" if gross_pnl_inr >= 0 else "-"
-            close_card = (
-                f"⚡ <b>ICE | POSITION CLOSED</b>\n"
-                f"{'🟢' if gross_pnl_inr >= 0 else '🔴'} <b>{sym} · {d['direction']} ({tf})</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏆 <b>PROFIT:</b> <b>{dir_sign}{pnl_pct:.2f}% ({sign}₹{net_pnl_inr:+,.2f} INR)</b>\n"
-                f"✅ <b>{outcome_emoji} ({sign}{rr_achieved:.2f}R)</b>"
-            )
-            edit_telegram_msg_by_id(msg_id, close_card)
 
 # ============================================================
 # MAIN PARALLEL MULTI-ASSET ENGINE
@@ -1358,7 +1185,7 @@ def run_trading_bot():
     }
 
     log.info("=" * 70)
-    log.info("ANTIGRAVITY BOT RUNNING DUAL ASSETS PARALLEL (BTCUSDT + GOLD XAUUSD)")
+    log.info("ICT BOT RUNNING DUAL ASSETS PARALLEL (BTCUSDT + GOLD XAUUSD)")
     for sym, cfg in PAIRS_CONFIG.items():
         p_state = BOT_STATE["pairs"][sym]
         log.info(f"  • {sym} ({cfg['label']}): Feed={cfg['chart_feed']}")
@@ -1386,8 +1213,6 @@ def run_trading_bot():
 
                     if df is None or len(df) < 30:
                         continue
-
-                    LATEST_LIVE_PRICES[sym] = float(df.iloc[-1]["Close"])
 
                     strat = engines[sym][tf]
 
@@ -1444,9 +1269,6 @@ def main():
 
     daily_sched_thread = threading.Thread(target=run_daily_report_scheduler, name="DailyScheduler", daemon=True)
     daily_sched_thread.start()
-
-    ice_monitor_thread = threading.Thread(target=run_ice_telegram_monitor, name="IceLiveMonitor", daemon=True)
-    ice_monitor_thread.start()
 
     def handle_shutdown(signum, frame):
         log.info(f"Shutdown signal received ({signum}). Exiting...")
