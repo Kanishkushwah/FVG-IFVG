@@ -122,8 +122,16 @@ def edit_telegram_msg_by_id(message_id: int, text: str) -> bool:
     }
     try:
         r = requests.post(url, json=payload, timeout=5)
-        return r.json().get("ok", False)
+        res = r.json()
+        if res.get("ok"):
+            return True
+        # If content didn't change, Telegram returns "message is not modified", which is still a success
+        if "message is not modified" in res.get("description", ""):
+            return True
+        log.warning(f"editMessageText failed on msg {message_id}: {res.get('description')}")
+        return False
     except Exception as e:
+        log.warning(f"editMessageText exception: {e}")
         return False
 
 def notify_telegram_async(text: str):
@@ -235,7 +243,7 @@ BOT_STATE = {
     "start_time": time.time(),
     "last_poll_time": None,
     "last_daily_report_date": None,
-    "live_monitor_msg_id": 44,
+    "live_monitor_msg_id": 45,
     "closed_trades_history": [],
     "pairs": {
         sym: {
